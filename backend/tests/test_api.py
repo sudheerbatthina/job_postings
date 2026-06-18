@@ -1,6 +1,5 @@
-"""Exercises the real FastAPI lifecycle with a mocked scraper (this sandbox
-has no internet access to LinkedIn/Indeed), to verify upload -> background
-task -> polling -> scoring -> xlsx export all work end to end.
+"""Exercises the real FastAPI lifecycle with mocked scraper, dedup, resume store,
+and Claude scoring — no internet access or API keys needed.
 Run with: pytest tests/test_api.py -v
 """
 import time
@@ -12,7 +11,11 @@ from fastapi.testclient import TestClient
 from app import main
 
 
-def _fake_scrape_all(location, is_remote, hours_old, on_progress=None):
+# ---------------------------------------------------------------------------
+# Shared fakes
+# ---------------------------------------------------------------------------
+
+def _fake_scrape_all(location, is_remote, hours_old, on_progress=None, search_terms=None):
     if on_progress:
         on_progress("Scraping: AI Engineer")
     rows = [
@@ -31,14 +34,36 @@ def _fake_scrape_all(location, is_remote, hours_old, on_progress=None):
     return df
 
 
+def _fake_score_with_claude(df, resume_text, client):
+    """Returns input df with claude_score=80 for all rows, sorted descending."""
+    if df.empty:
+        return df
+    df = df.copy()
+    df["claude_score"] = 80
+    return df.sort_values("claude_score", ascending=False).head(10).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Base fixture used by existing tests
+# ---------------------------------------------------------------------------
+
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setattr(main.scraper, "scrape_all", _fake_scrape_all)
     monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
     monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+    monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
+    monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
+    monkeypatch.setattr(main.resume_parser, "extract_keywords",
+                        lambda text, client: ["AI Engineer", "ML Engineer"])
+    monkeypatch.setattr(main.scoring, "score_with_claude", _fake_score_with_claude)
     with TestClient(main.app) as c:
         yield c
 
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
 def test_health(client):
     r = client.get("/api/health")
@@ -66,7 +91,7 @@ def test_full_lifecycle(client):
     assert body["status"] == "done", body
     assert body["error"] is None
     results = body["results"]
-    assert len(results) == 2, f"expected 2 (sales role filtered out), got {len(results)}"
+    assert len(results) == 2, f"expected 2 (sales role filtered out by prefilter), got {len(results)}"
     assert results[0]["title"] == "Senior AI Engineer"
 
     r = client.get(f"/api/analyze/{job_id}/export.xlsx")
@@ -79,3 +104,66 @@ def test_unknown_job_returns_404(client):
     r = client.get("/api/analyze/doesnotexist")
     assert r.status_code == 404
 
+
+def test_resume_reuse(monkeypatch):
+    """Second upload with same filename must skip extract_keywords (use cached resume)."""
+    extract_calls = []
+    stored_resume: dict = {}
+
+    def fake_extract_keywords(text, client):
+        extract_calls.append(text)
+        return ["AI Engineer", "ML Engineer"]
+
+    def fake_save_resume(**kw):
+        stored_resume.update(kw)
+
+    def fake_load_resume():
+        if stored_resume.get("filename"):
+            return {
+                "filename": stored_resume["filename"],
+                "text": stored_resume["text"],
+                "keywords": stored_resume["keywords"],
+                "email": stored_resume.get("email"),
+                "phone": stored_resume.get("phone"),
+            }
+        return None
+
+    monkeypatch.setattr(main.scraper, "scrape_all", _fake_scrape_all)
+    monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
+    monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+    monkeypatch.setattr(main.resume_store, "load_resume", fake_load_resume)
+    monkeypatch.setattr(main.resume_store, "save_resume", fake_save_resume)
+    monkeypatch.setattr(main.resume_parser, "extract_keywords", fake_extract_keywords)
+    monkeypatch.setattr(main.scoring, "score_with_claude", _fake_score_with_claude)
+
+    resume_bytes = b"Experienced engineer skilled in pytorch, llm, rag, langchain, aws, mlops, embeddings, python, kubernetes."
+    files = {"resume": ("resume.txt", resume_bytes, "text/plain")}
+    data = {"location": "United States", "is_remote": "false", "hours_old": "168"}
+
+    with TestClient(main.app) as c:
+        # First upload — should parse + extract
+        r = c.post("/api/analyze", files=files, data=data)
+        assert r.status_code == 200, r.text
+        job_id = r.json()["job_id"]
+        for _ in range(50):
+            body = c.get(f"/api/analyze/{job_id}").json()
+            if body["status"] in ("done", "error"):
+                break
+            time.sleep(0.1)
+        assert body["status"] == "done", body
+        assert len(extract_calls) == 1, "extract_keywords should be called on first upload"
+
+        # Second upload — same filename, should use cache
+        r = c.post("/api/analyze", files=files, data=data)
+        assert r.status_code == 200, r.text
+        job_id = r.json()["job_id"]
+        for _ in range(50):
+            body = c.get(f"/api/analyze/{job_id}").json()
+            if body["status"] in ("done", "error"):
+                break
+            time.sleep(0.1)
+        assert body["status"] == "done", body
+        assert len(extract_calls) == 1, (
+            f"extract_keywords should NOT be called on second upload (same filename), "
+            f"but was called {len(extract_calls)} times total"
+        )

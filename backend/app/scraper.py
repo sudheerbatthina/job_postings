@@ -37,9 +37,11 @@ def scrape_all(
     is_remote: bool,
     hours_old: int,
     on_progress: Optional[Callable[[str], None]] = None,
+    search_terms: Optional[list[str]] = None,
 ) -> pd.DataFrame:
+    terms = search_terms if search_terms is not None else config.SEARCH_TERMS
     frames = []
-    for term in config.SEARCH_TERMS:
+    for term in terms:
         if on_progress:
             on_progress(f"Scraping: {term}")
         try:

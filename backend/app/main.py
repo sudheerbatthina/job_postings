@@ -4,21 +4,36 @@ Endpoints:
   POST /api/analyze              upload resume + params -> {job_id}
   GET  /api/analyze/{job_id}     poll status / get results
   GET  /api/analyze/{job_id}/export.xlsx   download ranked results
+  GET  /api/resume               stored resume summary
   GET  /api/health               healthcheck
 """
 
 from __future__ import annotations
 import asyncio
+import json
 import os
+import re
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import anthropic
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-import io
+from fastapi.responses import StreamingResponse, JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
-from . import config, jobs_store, resume_parser, scraper, scoring, export, dedup
+from . import config, jobs_store, resume_parser, resume_store, scraper, scoring, export, dedup
+
+# ---------------------------------------------------------------------------
+# App + rate limiter
+# ---------------------------------------------------------------------------
+
+limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(title="AI Engineer Job Matcher")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 _origins = os.environ.get("FRONTEND_ORIGIN", "*")
 app.add_middleware(
@@ -28,14 +43,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------------------------------------------------------------------
+# Anthropic client (None if key not set — functions fall back gracefully)
+# ---------------------------------------------------------------------------
+
+ai_client: anthropic.Anthropic | None = None
+if os.environ.get("ANTHROPIC_API_KEY"):
+    ai_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
 
 
+@app.get("/api/resume")
+def get_resume():
+    stored = resume_store.load_resume()
+    if not stored:
+        return {"stored": False}
+    return {
+        "filename": stored.get("filename"),
+        "keywords": json.loads(stored.get("keywords") or "[]"),
+        "email": stored.get("email"),
+        "stored_at": stored.get("stored_at"),
+    }
+
+
 @app.post("/api/analyze")
+@limiter.limit("4/day")
 async def analyze(
+    request: Request,
     resume: UploadFile = File(...),
     location: str = Form("United States"),
     is_remote: bool = Form(False),
@@ -81,47 +123,125 @@ def export_xlsx(job_id: str):
     )
 
 
-async def _run_analysis(job_id, filename, content, location, is_remote, hours_old, top_results=config.TOP_RESULTS):
+# ---------------------------------------------------------------------------
+# Background pipeline
+# ---------------------------------------------------------------------------
+
+async def _run_analysis(
+    job_id: str,
+    filename: str,
+    content: bytes,
+    location: str,
+    is_remote: bool,
+    hours_old: int,
+    top_results: int = config.TOP_RESULTS,
+) -> None:
     try:
+        # Step 1: Resume — use cache if same filename, else parse + extract keywords
         jobs_store.update_job(job_id, status="running", message="Reading your resume")
-        parsed = await asyncio.to_thread(resume_parser.parse_resume, filename, content)
 
-        async with jobs_store.SCRAPE_SEMAPHORE:
-            jobs_store.update_job(job_id, message="Scraping job boards (this can take a minute)")
-
-            def progress(msg: str):
-                jobs_store.update_job(job_id, message=msg)
-
-            df = await asyncio.to_thread(
-                scraper.scrape_all, location, is_remote, hours_old, progress
-            )
-
-        if df.empty:
-            jobs_store.update_job(
-                job_id, status="done",
-                message="No jobs found — try widening the date range or check back later",
-                results=[],
-            )
-            return
-
-        df = await asyncio.to_thread(dedup.filter_unseen, df)
-        if df.empty:
-            jobs_store.update_job(
-                job_id, status="done",
-                message="No new jobs found since your last run — check back tomorrow",
-                results=[],
-            )
-            return
-
-        jobs_store.update_job(job_id, message="Scoring matches against your resume")
-        ranked = await asyncio.to_thread(scoring.score_and_rank, df, parsed["tokens"], hours_old, top_results)
-
-        if ranked.empty:
-            jobs_store.update_job(
-                job_id, status="done", message="No matching jobs found — try widening the date range", results=[]
-            )
+        stored = resume_store.load_resume()
+        if stored and stored.get("filename") == filename:
+            resume_text = stored["text"]
+            keywords = json.loads(stored.get("keywords") or "[]")
+            resume_tokens = {
+                t for t in re.findall(r"[a-zA-Z][a-zA-Z+#.\-]{2,}", resume_text.lower())
+                if t not in config.STOPWORDS
+            }
         else:
-            await asyncio.to_thread(dedup.mark_seen, ranked)
-            jobs_store.set_results(job_id, ranked)
+            parsed = await asyncio.to_thread(resume_parser.parse_resume, filename, content)
+            resume_text = parsed["text"]
+            resume_tokens = parsed["tokens"]
+            keywords = await asyncio.to_thread(resume_parser.extract_keywords, resume_text, ai_client)
+            resume_store.save_resume(
+                filename=filename,
+                text=resume_text,
+                keywords=json.dumps(keywords),
+                email=parsed.get("email"),
+                phone=parsed.get("phone"),
+            )
+
+        if not keywords:
+            keywords = ["AI Engineer", "Machine Learning Engineer"]
+
+        # Steps 2-6: window retry loop — widen search until we have 10 results
+        windows = [hours_old] + [h for h in config.FALLBACK_HOURS if h > hours_old]
+        all_scored = pd.DataFrame()
+
+        def progress(msg: str) -> None:
+            jobs_store.update_job(job_id, message=msg)
+
+        for window in windows:
+            if len(all_scored) >= top_results:
+                break
+
+            # Step 2: Scrape
+            async with jobs_store.SCRAPE_SEMAPHORE:
+                jobs_store.update_job(job_id, message=f"Searching jobs from last {window}h…")
+                df = await asyncio.to_thread(
+                    scraper.scrape_all, location, is_remote, window, progress,
+                    search_terms=keywords,
+                )
+
+            if df.empty:
+                continue
+
+            # Step 3: Dedup — drop jobs already returned in previous runs
+            df = await asyncio.to_thread(dedup.filter_unseen, df)
+
+            # Drop URLs already accumulated in earlier windows of this run
+            if not all_scored.empty and "job_url" in df.columns and "job_url" in all_scored.columns:
+                df = df[~df["job_url"].isin(all_scored["job_url"])].reset_index(drop=True)
+
+            if df.empty:
+                continue
+
+            # Step 4: Prefilter — fast token-overlap stage
+            jobs_store.update_job(job_id, message="Filtering matches…")
+            filtered = await asyncio.to_thread(scoring.prefilter, df, resume_tokens)
+
+            if filtered.empty:
+                continue
+
+            # Step 5: Claude scoring
+            jobs_store.update_job(job_id, message="Scoring with AI…")
+            scored = await asyncio.to_thread(
+                scoring.score_with_claude, filtered, resume_text, ai_client
+            )
+
+            if scored.empty:
+                continue
+
+            all_scored = (
+                pd.concat([all_scored, scored], ignore_index=True)
+                if not all_scored.empty else scored
+            )
+
+        if all_scored.empty:
+            jobs_store.update_job(
+                job_id, status="done",
+                message="No matching jobs found — try checking back tomorrow",
+                results=[],
+            )
+            return
+
+        # Step 6: Assemble final top-N, re-rank
+        final = (
+            all_scored
+            .sort_values("claude_score", ascending=False)
+            .drop_duplicates("job_url")
+            .head(top_results)
+            .reset_index(drop=True)
+        )
+        final.insert(0, "rank", range(1, len(final) + 1))
+
+        # Step 7: Mark only the returned jobs as seen
+        await asyncio.to_thread(dedup.mark_seen, final)
+        jobs_store.set_results(job_id, final)
+
     except Exception as e:
         jobs_store.update_job(job_id, status="error", message="Something went wrong", error=str(e))
+
+
+# StreamingResponse needs io
+import io  # noqa: E402 — kept at bottom to avoid circular-looking import at top

@@ -1,28 +1,17 @@
-"""Shared constants for scraping + scoring. Values carried over, unchanged,
-from the validated ai_engineer_jobs.py CLI script."""
-
-# Search terms for the AI Engineer track. (Multi-track is a future addition —
-# just add more lists here and let the API accept a `track` param.)
-SEARCH_TERMS = [
-    "AI Engineer",
-    "Machine Learning Engineer",
-    "ML Engineer",
-    "Applied Scientist",
-    "LLM Engineer",
-    "Generative AI Engineer",
-    "Deep Learning Engineer",
-]
+"""Shared constants for scraping + scoring."""
 
 SITES = ["linkedin", "indeed", "google", "zip_recruiter"]
 COUNTRY_INDEED = "USA"
 
-# Kept modest on purpose: this runs inside a single web request's background
-# task, on a free/cheap Railway instance, serialized behind one semaphore.
 RESULTS_WANTED_PER_TERM = 25
-DEFAULT_HOURS_OLD = 168  # 7 days
+DEFAULT_HOURS_OLD = 24
+FALLBACK_HOURS = [72, 168]
 
 WEIGHTS = {"keyword": 0.45, "resume": 0.25, "recency": 0.30}
 MIN_KEYWORD_SCORE = 0.10
+MIN_SCORE_THRESHOLD = 75
+MIN_SCORE_FALLBACK = 50
+TOP_RESULTS = 10
 
 AI_KEYWORDS = {
     "machine learning": 3, "deep learning": 3, "ai engineer": 4,
@@ -47,8 +36,6 @@ TITLE_BLOCKLIST = [
 STOPWORDS = set("""a an the and or of to in for with on at by from as is are be this that
 your you we our will have has can able role team work years experience strong
 skills ability requirements preferred plus etc using use used job position company""".split())
-
-TOP_RESULTS = 10
 
 # How long a finished/errored job stays in memory before being pruned.
 JOB_TTL_SECONDS = 60 * 60  # 1 hour
