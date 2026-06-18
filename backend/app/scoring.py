@@ -53,7 +53,7 @@ def title_blocked(title: str) -> bool:
     return any(b in t for b in config.TITLE_BLOCKLIST)
 
 
-def score_and_rank(df: pd.DataFrame, resume_tokens: set[str], hours_old: int) -> pd.DataFrame:
+def score_and_rank(df: pd.DataFrame, resume_tokens: set[str], hours_old: int, top_results: int = config.TOP_RESULTS) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.drop_duplicates(subset="job_url")
@@ -77,5 +77,6 @@ def score_and_rank(df: pd.DataFrame, resume_tokens: set[str], hours_old: int) ->
     df["score_100"] = (df["score"] / total_w * 100).round(0).astype(int)
 
     df = df.sort_values(["score_100", "recency"], ascending=False).reset_index(drop=True)
-    df.insert(0, "rank", range(1, len(df) + 1))
+    df = df.head(top_results)
+    df["rank"] = range(1, len(df) + 1)
     return df

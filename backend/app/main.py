@@ -40,6 +40,7 @@ async def analyze(
     location: str = Form("United States"),
     is_remote: bool = Form(False),
     hours_old: int = Form(config.DEFAULT_HOURS_OLD),
+    top_results: int = Form(config.TOP_RESULTS),
 ):
     content = await resume.read()
     if not content:
@@ -47,7 +48,7 @@ async def analyze(
 
     job_id = jobs_store.create_job()
     asyncio.create_task(
-        _run_analysis(job_id, resume.filename, content, location, is_remote, hours_old)
+        _run_analysis(job_id, resume.filename, content, location, is_remote, hours_old, top_results)
     )
     return {"job_id": job_id}
 
@@ -80,7 +81,7 @@ def export_xlsx(job_id: str):
     )
 
 
-async def _run_analysis(job_id, filename, content, location, is_remote, hours_old):
+async def _run_analysis(job_id, filename, content, location, is_remote, hours_old, top_results=config.TOP_RESULTS):
     try:
         jobs_store.update_job(job_id, status="running", message="Reading your resume")
         parsed = await asyncio.to_thread(resume_parser.parse_resume, filename, content)
@@ -96,7 +97,7 @@ async def _run_analysis(job_id, filename, content, location, is_remote, hours_ol
             )
 
         jobs_store.update_job(job_id, message="Scoring matches against your resume")
-        ranked = await asyncio.to_thread(scoring.score_and_rank, df, parsed["tokens"], hours_old)
+        ranked = await asyncio.to_thread(scoring.score_and_rank, df, parsed["tokens"], hours_old, top_results)
 
         if ranked.empty:
             jobs_store.update_job(
