@@ -68,6 +68,8 @@ def score_and_rank(df: pd.DataFrame, resume_tokens: set[str], hours_old: int, to
         df["date_posted"] = None
 
     df = df[~df["title"].apply(title_blocked)].copy()
+    if df.empty:
+        return df
 
     df["kw_score"] = df.apply(lambda r: keyword_score(r["title"], r["description"]), axis=1)
     df["resume_match"] = df.apply(lambda r: resume_score(r["description"], resume_tokens), axis=1)

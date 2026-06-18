@@ -34,6 +34,8 @@ def _fake_scrape_all(location, is_remote, hours_old, on_progress=None):
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setattr(main.scraper, "scrape_all", _fake_scrape_all)
+    monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
+    monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
     with TestClient(main.app) as c:
         yield c
 

@@ -4,6 +4,7 @@ with more than one concurrent run from this server's IP."""
 
 from __future__ import annotations
 import asyncio
+import math
 import time
 import uuid
 from typing import Optional
@@ -39,6 +40,16 @@ def get_job(job_id: str) -> Optional[dict]:
     return JOBS.get(job_id)
 
 
+def _sanitize(val):
+    if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+        return None
+    return val
+
+
+def _sanitize_record(record: dict) -> dict:
+    return {k: _sanitize(v) for k, v in record.items()}
+
+
 def set_results(job_id: str, df: pd.DataFrame) -> None:
     records = df.drop(columns=[c for c in ["kw_score", "resume_match"] if c in df.columns], errors="ignore")
     records = records.where(pd.notnull(records), None)
@@ -46,7 +57,7 @@ def set_results(job_id: str, df: pd.DataFrame) -> None:
         job_id,
         status="done",
         message=f"Found {len(df)} matching jobs",
-        results=records.to_dict(orient="records"),
+        results=[_sanitize_record(r) for r in records.to_dict(orient="records")],
         _df=df,
     )
 
