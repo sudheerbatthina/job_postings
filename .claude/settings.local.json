@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(python -c \"from jobspy import scrape_jobs; print\\('ok'\\)\")",
+      "Bash(pip check *)",
+      "Bash(python -c \"import ai_engineer_jobs\")"
+    ]
+  }
+}

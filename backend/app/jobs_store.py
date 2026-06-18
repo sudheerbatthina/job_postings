@@ -1,0 +1,58 @@
+"""In-memory job tracking — no database for v1. A single process-wide
+semaphore serializes actual scraping so the app never hits LinkedIn/Indeed
+with more than one concurrent run from this server's IP."""
+
+from __future__ import annotations
+import asyncio
+import time
+import uuid
+from typing import Optional
+
+import pandas as pd
+
+from . import config
+
+JOBS: dict[str, dict] = {}
+SCRAPE_SEMAPHORE = asyncio.Semaphore(1)
+
+
+def create_job() -> str:
+    _prune_old_jobs()
+    job_id = uuid.uuid4().hex
+    JOBS[job_id] = {
+        "status": "pending",
+        "message": "Queued",
+        "results": None,
+        "error": None,
+        "created_at": time.time(),
+        "_df": None,  # holds the ranked DataFrame for the xlsx export endpoint
+    }
+    return job_id
+
+
+def update_job(job_id: str, **fields) -> None:
+    if job_id in JOBS:
+        JOBS[job_id].update(fields)
+
+
+def get_job(job_id: str) -> Optional[dict]:
+    return JOBS.get(job_id)
+
+
+def set_results(job_id: str, df: pd.DataFrame) -> None:
+    records = df.drop(columns=[c for c in ["kw_score", "resume_match"] if c in df.columns], errors="ignore")
+    records = records.where(pd.notnull(records), None)
+    update_job(
+        job_id,
+        status="done",
+        message=f"Found {len(df)} matching jobs",
+        results=records.to_dict(orient="records"),
+        _df=df,
+    )
+
+
+def _prune_old_jobs() -> None:
+    cutoff = time.time() - config.JOB_TTL_SECONDS
+    stale = [jid for jid, j in JOBS.items() if j.get("created_at", 0) < cutoff]
+    for jid in stale:
+        JOBS.pop(jid, None)

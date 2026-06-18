@@ -1,0 +1,11 @@
+@import "tailwindcss";
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&display=swap");
+
+:root {
+  --font-mono-accent: "JetBrains Mono", ui-monospace, monospace;
+}
+
+body {
+  background-color: #faf9f7;
+  color: #1c1c1a;
+}
