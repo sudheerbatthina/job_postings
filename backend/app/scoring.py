@@ -58,10 +58,19 @@ def score_and_rank(df: pd.DataFrame, resume_tokens: set[str], hours_old: int, to
         return df
     df = df.drop_duplicates(subset="job_url")
     df = df.drop_duplicates(subset=["title", "company"]).reset_index(drop=True)
+
+    for col in ("title", "description"):
+        if col not in df.columns:
+            df[col] = ""
+        else:
+            df[col] = df[col].fillna("")
+    if "date_posted" not in df.columns:
+        df["date_posted"] = None
+
     df = df[~df["title"].apply(title_blocked)].copy()
 
-    df["kw_score"] = df.apply(lambda r: keyword_score(r.get("title"), r.get("description")), axis=1)
-    df["resume_match"] = df.apply(lambda r: resume_score(r.get("description"), resume_tokens), axis=1)
+    df["kw_score"] = df.apply(lambda r: keyword_score(r["title"], r["description"]), axis=1)
+    df["resume_match"] = df.apply(lambda r: resume_score(r["description"], resume_tokens), axis=1)
     df["recency"] = df["date_posted"].apply(lambda d: recency_score(d, hours_old))
 
     df = df[df["kw_score"] >= config.MIN_KEYWORD_SCORE].copy()

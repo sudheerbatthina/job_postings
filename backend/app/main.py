@@ -96,6 +96,14 @@ async def _run_analysis(job_id, filename, content, location, is_remote, hours_ol
                 scraper.scrape_all, location, is_remote, hours_old, progress
             )
 
+        if df.empty:
+            jobs_store.update_job(
+                job_id, status="done",
+                message="No jobs found — try widening the date range or check back later",
+                results=[],
+            )
+            return
+
         jobs_store.update_job(job_id, message="Scoring matches against your resume")
         ranked = await asyncio.to_thread(scoring.score_and_rank, df, parsed["tokens"], hours_old, top_results)
 
