@@ -48,7 +48,7 @@ STOPWORDS = set("""a an the and or of to in for with on at by from as is are be 
 your you we our will have has can able role team work years experience strong
 skills ability requirements preferred plus etc using use used job position company""".split())
 
-TOP_RESULTS = 20
+TOP_RESULTS = 10
 
 # How long a finished/errored job stays in memory before being pruned.
 JOB_TTL_SECONDS = 60 * 60  # 1 hour

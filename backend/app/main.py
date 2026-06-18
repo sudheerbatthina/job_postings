@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import io
 
-from . import config, jobs_store, resume_parser, scraper, scoring, export
+from . import config, jobs_store, resume_parser, scraper, scoring, export, dedup
 
 app = FastAPI(title="AI Engineer Job Matcher")
 
@@ -104,6 +104,15 @@ async def _run_analysis(job_id, filename, content, location, is_remote, hours_ol
             )
             return
 
+        df = await asyncio.to_thread(dedup.filter_unseen, df)
+        if df.empty:
+            jobs_store.update_job(
+                job_id, status="done",
+                message="No new jobs found since your last run — check back tomorrow",
+                results=[],
+            )
+            return
+
         jobs_store.update_job(job_id, message="Scoring matches against your resume")
         ranked = await asyncio.to_thread(scoring.score_and_rank, df, parsed["tokens"], hours_old, top_results)
 
@@ -112,6 +121,7 @@ async def _run_analysis(job_id, filename, content, location, is_remote, hours_ol
                 job_id, status="done", message="No matching jobs found — try widening the date range", results=[]
             )
         else:
+            await asyncio.to_thread(dedup.mark_seen, ranked)
             jobs_store.set_results(job_id, ranked)
     except Exception as e:
         jobs_store.update_job(job_id, status="error", message="Something went wrong", error=str(e))
