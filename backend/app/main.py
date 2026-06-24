@@ -186,6 +186,7 @@ async def _run_analysis(
         windows = [hours_old] + [h for h in config.FALLBACK_HOURS if h > hours_old]
         # Dict keyed by job_url prevents re-scoring the same job across windows
         all_scored: dict[str, dict] = {}
+        timed_out = False
 
         def progress(msg: str) -> None:
             jobs_store.update_job(job_id, message=msg)
@@ -194,10 +195,10 @@ async def _run_analysis(
             if len(all_scored) >= top_results:
                 break
 
-            # Step 2: Scrape — timeout inside the semaphore so a hang still releases it
-            async with jobs_store.SCRAPE_SEMAPHORE:
-                jobs_store.update_job(job_id, message=f"Searching jobs from last {window}h…")
-                try:
+            try:
+                # Step 2: Scrape — timeout inside the semaphore so a hang still releases it
+                async with jobs_store.SCRAPE_SEMAPHORE:
+                    jobs_store.update_job(job_id, message=f"Searching jobs from last {window}h…")
                     df = await asyncio.wait_for(
                         asyncio.to_thread(
                             scraper.scrape_all, location, is_remote, window, progress,
@@ -205,51 +206,53 @@ async def _run_analysis(
                         ),
                         timeout=config.SCRAPE_TIMEOUT_SECONDS,
                     )
-                except asyncio.TimeoutError:
-                    raise RuntimeError(
-                        "Scraping timed out — job boards may be slow, try again."
-                    )
 
-            if df.empty:
-                continue
+                if df.empty:
+                    continue
 
-            # Step 3: Dedup — drop jobs already returned in previous runs
-            df = await asyncio.to_thread(dedup.filter_unseen, df)
+                # Step 3: Dedup — drop jobs already returned in previous runs
+                df = await asyncio.to_thread(dedup.filter_unseen, df)
 
-            # Drop URLs already accumulated in earlier windows of this run
-            if all_scored and "job_url" in df.columns:
-                df = df[~df["job_url"].isin(all_scored.keys())].reset_index(drop=True)
+                # Drop URLs already accumulated in earlier windows of this run
+                if all_scored and "job_url" in df.columns:
+                    df = df[~df["job_url"].isin(all_scored.keys())].reset_index(drop=True)
 
-            if df.empty:
-                continue
+                if df.empty:
+                    continue
 
-            # Step 4: Prefilter — fast token-overlap stage
-            jobs_store.update_job(job_id, message="Filtering matches…")
-            filtered = await asyncio.to_thread(scoring.prefilter, df, resume_tokens)
+                # Step 4: Prefilter — fast token-overlap stage
+                jobs_store.update_job(job_id, message="Filtering matches…")
+                filtered = await asyncio.to_thread(scoring.prefilter, df, resume_tokens)
 
-            if filtered.empty:
-                continue
+                if filtered.empty:
+                    continue
 
-            # Step 5: Claude scoring — returns all rows sorted by score, no threshold
-            jobs_store.update_job(job_id, message="Scoring with AI…")
-            scored = await asyncio.wait_for(
-                asyncio.to_thread(
-                    scoring.score_with_claude, filtered, resume_text, ai_client
-                ),
-                timeout=config.SCRAPE_TIMEOUT_SECONDS,
-            )
+                # Step 5: Claude scoring — returns all rows sorted by score, no threshold
+                jobs_store.update_job(job_id, message="Scoring with AI…")
+                scored = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        scoring.score_with_claude, filtered, resume_text, ai_client
+                    ),
+                    timeout=config.SCRAPE_TIMEOUT_SECONDS,
+                )
 
-            for _, row in scored.iterrows():
-                url = row.get("job_url")
-                if url and url not in all_scored:
-                    all_scored[url] = row.to_dict()
+                for _, row in scored.iterrows():
+                    url = row.get("job_url")
+                    if url and url not in all_scored:
+                        all_scored[url] = row.to_dict()
+
+            except asyncio.TimeoutError:
+                jobs_store.update_job(job_id, message=f"Timed out on {window}h window — using results so far…")
+                timed_out = True
+                break
 
         if not all_scored:
-            jobs_store.update_job(
-                job_id, status="done",
-                message="No matching jobs found — try checking back later",
-                results=[],
+            msg = (
+                "Job boards were too slow to respond — try again in a few minutes"
+                if timed_out
+                else "No matching jobs found — try checking back later"
             )
+            jobs_store.update_job(job_id, status="done", message=msg, results=[])
             return
 
         # Step 6: Assemble final top-N across all windows, re-rank
@@ -259,7 +262,14 @@ async def _run_analysis(
 
         # Step 7: Mark only the returned jobs as seen
         await asyncio.to_thread(dedup.mark_seen, final)
-        jobs_store.set_results(job_id, final)
+
+        n = len(final)
+        done_msg = (
+            f"Found {n} job{'' if n == 1 else 's'} (search cut short — a job board was slow)"
+            if timed_out
+            else f"Found {n} matching job{'' if n == 1 else 's'}"
+        )
+        jobs_store.set_results(job_id, final, message=done_msg)
 
     except Exception as e:
         jobs_store.update_job(job_id, status="error", message="Something went wrong", error=str(e))

@@ -2,6 +2,7 @@
 and Claude scoring — no internet access or API keys needed.
 Run with: pytest tests/test_api.py -v
 """
+import asyncio
 import time
 from datetime import date, timedelta
 import pandas as pd
@@ -9,6 +10,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main
+
+
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    """Clear in-memory rate-limit counters before each test so tests don't bleed."""
+    try:
+        main.limiter._storage.reset()
+    except Exception:
+        pass
+    yield
 
 
 # ---------------------------------------------------------------------------
@@ -214,3 +225,49 @@ def test_resume_reuse(monkeypatch):
             f"extract_keywords should NOT be called on second upload (same filename), "
             f"but was called {len(extract_calls)} times total"
         )
+
+
+def test_timeout_mid_loop_returns_partial_results(monkeypatch):
+    """If the 72h fallback window times out, the job should still complete with
+    whatever results were scored in the first (24h) window."""
+    call_count = 0
+
+    def scrape_first_ok_then_timeout(location, is_remote, hours_old, on_progress=None, search_terms=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return _fake_scrape_all(location, is_remote, hours_old, on_progress, search_terms)
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(main.scraper, "scrape_all", scrape_first_ok_then_timeout)
+    monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
+    monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+    monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
+    monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
+    monkeypatch.setattr(main.resume_parser, "extract_keywords",
+                        lambda text, client: ["AI Engineer", "ML Engineer"])
+    monkeypatch.setattr(main.scoring, "score_with_claude", _fake_score_with_claude)
+
+    resume_bytes = b"Experienced engineer skilled in pytorch, llm, rag, langchain, aws, mlops, embeddings, python, kubernetes."
+    files = {"resume": ("resume.txt", resume_bytes, "text/plain")}
+    # hours_old=24 means windows=[24, 72]; first succeeds, second raises TimeoutError
+    data = {"location": "United States", "is_remote": "false", "hours_old": "24"}
+
+    with TestClient(main.app) as c:
+        r = c.post("/api/analyze", files=files, data=data)
+        assert r.status_code == 200, r.text
+        job_id = r.json()["job_id"]
+
+        body = None
+        for _ in range(50):
+            r = c.get(f"/api/analyze/{job_id}")
+            body = r.json()
+            if body["status"] in ("done", "error"):
+                break
+            time.sleep(0.1)
+
+    assert body["status"] == "done", f"Expected done, got: {body}"
+    assert body["error"] is None
+    results = body["results"]
+    assert len(results) >= 1, "Should have results from the first (non-timed-out) window"
+    assert "cut short" in body["message"], f"Message should note partial results: {body['message']}"

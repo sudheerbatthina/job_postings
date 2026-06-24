@@ -50,13 +50,13 @@ def _sanitize_record(record: dict) -> dict:
     return {k: _sanitize(v) for k, v in record.items()}
 
 
-def set_results(job_id: str, df: pd.DataFrame) -> None:
+def set_results(job_id: str, df: pd.DataFrame, message: str | None = None) -> None:
     records = df.drop(columns=[c for c in ["kw_score", "resume_match"] if c in df.columns], errors="ignore")
     records = records.where(pd.notnull(records), None)
     update_job(
         job_id,
         status="done",
-        message=f"Found {len(df)} matching jobs",
+        message=message or f"Found {len(df)} matching jobs",
         results=[_sanitize_record(r) for r in records.to_dict(orient="records")],
         _df=df,
     )
