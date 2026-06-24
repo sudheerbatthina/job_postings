@@ -5,6 +5,7 @@ import ResultsTable from "./components/ResultsTable";
 import { submitResume, getJobStatus } from "./api";
 
 const POLL_INTERVAL_MS = 2000;
+const MAX_POLLS = 90; // 3 minutes at 2 s interval
 
 export default function App() {
   const [stage, setStage] = useState("upload"); // upload | polling | done | error
@@ -12,12 +13,14 @@ export default function App() {
   const [results, setResults] = useState([]);
   const [jobId, setJobId] = useState(null);
   const pollRef = useRef(null);
+  const pollCountRef = useRef(0);
 
   useEffect(() => () => clearInterval(pollRef.current), []);
 
   const handleSubmit = async (params) => {
     setStage("polling");
     setMessage("Uploading resume...");
+    pollCountRef.current = 0;
     try {
       const { job_id } = await submitResume(params);
       setJobId(job_id);
@@ -29,6 +32,15 @@ export default function App() {
   };
 
   const poll = async (id) => {
+    pollCountRef.current += 1;
+    if (pollCountRef.current > MAX_POLLS) {
+      clearInterval(pollRef.current);
+      setStage("error");
+      setMessage(
+        "This is taking longer than expected — the job boards may be rate limiting us. Try again in a few minutes."
+      );
+      return;
+    }
     try {
       const data = await getJobStatus(id);
       setMessage(data.message);

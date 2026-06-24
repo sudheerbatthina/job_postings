@@ -49,7 +49,10 @@ app.add_middleware(
 
 ai_client: anthropic.Anthropic | None = None
 if os.environ.get("ANTHROPIC_API_KEY"):
-    ai_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    ai_client = anthropic.Anthropic(
+        api_key=os.environ.get("ANTHROPIC_API_KEY"),
+        timeout=config.CLAUDE_TIMEOUT_SECONDS,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +155,10 @@ async def _run_analysis(
             parsed = await asyncio.to_thread(resume_parser.parse_resume, filename, content)
             resume_text = parsed["text"]
             resume_tokens = parsed["tokens"]
-            keywords = await asyncio.to_thread(resume_parser.extract_keywords, resume_text, ai_client)
+            keywords = await asyncio.wait_for(
+                asyncio.to_thread(resume_parser.extract_keywords, resume_text, ai_client),
+                timeout=config.CLAUDE_TIMEOUT_SECONDS,
+            )
             resume_store.save_resume(
                 filename=filename,
                 text=resume_text,
@@ -175,13 +181,21 @@ async def _run_analysis(
             if len(all_scored) >= top_results:
                 break
 
-            # Step 2: Scrape
+            # Step 2: Scrape — timeout inside the semaphore so a hang still releases it
             async with jobs_store.SCRAPE_SEMAPHORE:
                 jobs_store.update_job(job_id, message=f"Searching jobs from last {window}h…")
-                df = await asyncio.to_thread(
-                    scraper.scrape_all, location, is_remote, window, progress,
-                    search_terms=keywords,
-                )
+                try:
+                    df = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            scraper.scrape_all, location, is_remote, window, progress,
+                            search_terms=keywords,
+                        ),
+                        timeout=config.SCRAPE_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        "Scraping timed out — job boards may be slow, try again."
+                    )
 
             if df.empty:
                 continue
@@ -205,8 +219,11 @@ async def _run_analysis(
 
             # Step 5: Claude scoring
             jobs_store.update_job(job_id, message="Scoring with AI…")
-            scored = await asyncio.to_thread(
-                scoring.score_with_claude, filtered, resume_text, ai_client
+            scored = await asyncio.wait_for(
+                asyncio.to_thread(
+                    scoring.score_with_claude, filtered, resume_text, ai_client
+                ),
+                timeout=config.SCRAPE_TIMEOUT_SECONDS,
             )
 
             if scored.empty:
