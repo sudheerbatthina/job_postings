@@ -44,29 +44,36 @@ def parse_resume(filename: str, content: bytes) -> dict:
     }
 
 
-def _bigram_fallback(text: str) -> list[str]:
+def _bigram_fallback(text: str) -> dict:
     words = [w for w in re.findall(r"[a-zA-Z]{3,}", text.lower()) if w not in config.STOPWORDS]
     counts: dict[str, int] = {}
     for i in range(len(words) - 1):
         bg = f"{words[i]} {words[i + 1]}"
         counts[bg] = counts.get(bg, 0) + 1
-    return [bg for bg, _ in sorted(counts.items(), key=lambda x: -x[1])[:8]]
+    titles = [bg for bg, _ in sorted(counts.items(), key=lambda x: -x[1])[:6]]
+    return {"search_titles": titles, "skill_signals": []}
 
 
-def extract_keywords(text: str, client: "_anthropic.Anthropic | None") -> list[str]:
-    """Call Claude to extract 6-8 recruiter-style search phrases from resume text.
-    Falls back to top bigrams if the API is unavailable."""
+def extract_keywords(text: str, client: "_anthropic.Anthropic | None") -> dict:
+    """Call Claude to extract job-board search titles and skill signals from resume text.
+    Returns {"search_titles": [...], "skill_signals": [...]}.
+    Falls back to top bigrams (search_titles only) if the API is unavailable."""
     if client is not None:
         try:
             msg = client.messages.create(
                 model="claude-haiku-4-5",
-                max_tokens=200,
+                max_tokens=300,
                 messages=[{
                     "role": "user",
                     "content": (
-                        "Read this resume and extract 6-8 short job title or skill phrases "
-                        "that best describe this person's target roles for a US job search. "
-                        "Think like a recruiter. Return only a JSON array of strings, no explanation.\n\n"
+                        "From this resume, return JSON with two arrays:\n"
+                        "search_titles: 4-6 generic, job-board-searchable role titles this person is "
+                        "qualified for (e.g. 'AI Engineer', 'Senior Machine Learning Engineer') — these "
+                        "get typed into a job board search box, so they must look like real job titles, "
+                        "not skill names.\n"
+                        "skill_signals: 6-10 specific technical phrases that differentiate this candidate "
+                        "(e.g. 'RAG', 'LangGraph', 'agentic AI', 'MCP') — used for scoring fit, not for searching.\n"
+                        'Return only valid JSON: {"search_titles": [...], "skill_signals": [...]}\n\n'
                         + text[:3000]
                     ),
                 }],

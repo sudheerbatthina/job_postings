@@ -97,10 +97,23 @@ def prefilter(df: pd.DataFrame, resume_tokens: set[str]) -> pd.DataFrame:
 # Stage 2: Claude scoring
 # ---------------------------------------------------------------------------
 
-def claude_score(job_description: str, resume_text: str, client: "_anthropic.Anthropic | None") -> int:
+def claude_score(
+    job_description: str,
+    resume_text: str,
+    skill_signals: list[str],
+    client: "_anthropic.Anthropic | None",
+) -> int:
     """Ask Claude Haiku to score resume↔job fit on 0-100. Returns 0 on any failure."""
     if client is None:
         return 0
+    signals_note = ""
+    if skill_signals:
+        signals_str = ", ".join(skill_signals)
+        signals_note = (
+            f"This candidate's key differentiating skills are: {signals_str}. "
+            "Weigh how well the job description matches these specifically, "
+            "not just generic ML/AI terms.\n"
+        )
     try:
         msg = client.messages.create(
             model="claude-haiku-4-5",
@@ -110,8 +123,9 @@ def claude_score(job_description: str, resume_text: str, client: "_anthropic.Ant
                 "content": (
                     'Score how well this resume matches this job description. '
                     'Return only a JSON object: {"score": <0-100>}.\n'
-                    f"Resume: {resume_text[:2000]}\n"
-                    f"Job: {job_description[:1500]}"
+                    + signals_note
+                    + f"Resume: {resume_text[:2000]}\n"
+                    + f"Job: {job_description[:1500]}"
                 ),
             }],
         )
@@ -124,6 +138,7 @@ def claude_score(job_description: str, resume_text: str, client: "_anthropic.Ant
 def score_with_claude(
     df: pd.DataFrame,
     resume_text: str,
+    skill_signals: list[str],
     client: "_anthropic.Anthropic | None",
 ) -> pd.DataFrame:
     """Apply claude_score to each row and return all rows sorted by score descending.
@@ -132,7 +147,7 @@ def score_with_claude(
         return df
     df = df.copy()
     df["claude_score"] = df["description"].fillna("").apply(
-        lambda desc: claude_score(desc, resume_text, client)
+        lambda desc: claude_score(desc, resume_text, skill_signals, client)
     )
     return df.sort_values("claude_score", ascending=False).reset_index(drop=True)
 

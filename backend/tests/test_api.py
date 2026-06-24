@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
-from app import main
+from app import main, scraper as scraper_mod
 
 
 @pytest.fixture(autouse=True)
@@ -45,7 +45,10 @@ def _fake_scrape_all(location, is_remote, hours_old, on_progress=None, search_te
     return df
 
 
-def _fake_score_with_claude(df, resume_text, client):
+_FAKE_KW = {"search_titles": ["AI Engineer", "ML Engineer"], "skill_signals": ["RAG", "LangChain"]}
+
+
+def _fake_score_with_claude(df, resume_text, skill_signals, client):
     """Returns all rows with claude_score=80, sorted descending (no threshold, no slice)."""
     if df.empty:
         return df
@@ -66,7 +69,7 @@ def client(monkeypatch):
     monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
     monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
     monkeypatch.setattr(main.resume_parser, "extract_keywords",
-                        lambda text, client: ["AI Engineer", "ML Engineer"])
+                        lambda text, client: _FAKE_KW)
     monkeypatch.setattr(main.scoring, "score_with_claude", _fake_score_with_claude)
     with TestClient(main.app) as c:
         yield c
@@ -120,7 +123,7 @@ def test_results_sorted_by_claude_score(monkeypatch):
     """Results must be sorted descending by claude_score even when scores are low
     (i.e. below what used to be the 75/50 thresholds that no longer exist)."""
 
-    def low_score_claude(df, resume_text, client):
+    def low_score_claude(df, resume_text, skill_signals, client):
         if df.empty:
             return df
         df = df.copy()
@@ -136,7 +139,7 @@ def test_results_sorted_by_claude_score(monkeypatch):
         monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
         monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
         monkeypatch.setattr(main.resume_parser, "extract_keywords",
-                            lambda text, client: ["AI Engineer", "ML Engineer"])
+                            lambda text, client: _FAKE_KW)
         monkeypatch.setattr(main.scoring, "score_with_claude", low_score_claude)
 
         resume_text = b"Experienced engineer skilled in pytorch, llm, rag, langchain, aws, mlops, embeddings, python, kubernetes."
@@ -170,7 +173,7 @@ def test_resume_reuse(monkeypatch):
 
     def fake_extract_keywords(text, client):
         extract_calls.append(text)
-        return ["AI Engineer", "ML Engineer"]
+        return _FAKE_KW
 
     def fake_save_resume(**kw):
         stored_resume.update(kw)
@@ -180,7 +183,8 @@ def test_resume_reuse(monkeypatch):
             return {
                 "filename": stored_resume["filename"],
                 "text": stored_resume["text"],
-                "keywords": stored_resume["keywords"],
+                "search_titles": stored_resume.get("search_titles", "[]"),
+                "skill_signals": stored_resume.get("skill_signals", "[]"),
                 "email": stored_resume.get("email"),
                 "phone": stored_resume.get("phone"),
             }
@@ -245,7 +249,7 @@ def test_timeout_mid_loop_returns_partial_results(monkeypatch):
     monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
     monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
     monkeypatch.setattr(main.resume_parser, "extract_keywords",
-                        lambda text, client: ["AI Engineer", "ML Engineer"])
+                        lambda text, client: _FAKE_KW)
     monkeypatch.setattr(main.scoring, "score_with_claude", _fake_score_with_claude)
 
     resume_bytes = b"Experienced engineer skilled in pytorch, llm, rag, langchain, aws, mlops, embeddings, python, kubernetes."
@@ -271,3 +275,31 @@ def test_timeout_mid_loop_returns_partial_results(monkeypatch):
     results = body["results"]
     assert len(results) >= 1, "Should have results from the first (non-timed-out) window"
     assert "cut short" in body["message"], f"Message should note partial results: {body['message']}"
+
+
+def test_glassdoor_location_filtering(monkeypatch):
+    """Glassdoor must be excluded when location is broad (no comma) and included
+    when it looks like a specific city (contains a comma)."""
+    captured_site_lists = []
+
+    def capture_scrape_jobs(**kwargs):
+        captured_site_lists.append(list(kwargs.get("site_name", [])))
+        return pd.DataFrame()
+
+    monkeypatch.setattr(scraper_mod, "scrape_jobs", capture_scrape_jobs)
+
+    # Broad location — Glassdoor should be excluded from every scrape_jobs call
+    scraper_mod.scrape_all("United States", False, 24, search_terms=["AI Engineer"])
+    assert captured_site_lists, "Expected at least one scrape_jobs call"
+    assert all("glassdoor" not in sites for sites in captured_site_lists), (
+        f"Glassdoor should be excluded for broad location, got site lists: {captured_site_lists}"
+    )
+
+    captured_site_lists.clear()
+
+    # Specific city — Glassdoor should be present
+    scraper_mod.scrape_all("New York, NY", False, 24, search_terms=["AI Engineer"])
+    assert captured_site_lists, "Expected at least one scrape_jobs call"
+    assert all("glassdoor" in sites for sites in captured_site_lists), (
+        f"Glassdoor should be included for specific location, got site lists: {captured_site_lists}"
+    )

@@ -24,16 +24,24 @@ def _conn():
     try:
         con.execute("""
             CREATE TABLE IF NOT EXISTS resume (
-                id       INTEGER PRIMARY KEY,
-                filename TEXT,
-                text     TEXT,
-                keywords TEXT,
-                email    TEXT,
-                phone    TEXT,
-                stored_at TEXT
+                id            INTEGER PRIMARY KEY,
+                filename      TEXT,
+                text          TEXT,
+                search_titles TEXT,
+                skill_signals TEXT,
+                email         TEXT,
+                phone         TEXT,
+                stored_at     TEXT
             )
         """)
         con.commit()
+        # Migrate old DBs that have the legacy `keywords` column but not the new ones
+        for col in ("search_titles", "skill_signals"):
+            try:
+                con.execute(f"ALTER TABLE resume ADD COLUMN {col} TEXT")
+                con.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
         yield con
     finally:
         con.close()
@@ -42,7 +50,8 @@ def _conn():
 def save_resume(
     filename: str,
     text: str,
-    keywords: str,
+    search_titles: str,
+    skill_signals: str,
     email: str | None,
     phone: str | None,
 ) -> None:
@@ -50,9 +59,9 @@ def save_resume(
     with _conn() as con:
         con.execute("DELETE FROM resume")
         con.execute(
-            "INSERT INTO resume (filename, text, keywords, email, phone, stored_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (filename, text, keywords, email, phone, now),
+            "INSERT INTO resume (filename, text, search_titles, skill_signals, email, phone, stored_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (filename, text, search_titles, skill_signals, email, phone, now),
         )
         con.commit()
 

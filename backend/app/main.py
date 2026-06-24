@@ -71,7 +71,8 @@ def get_resume():
         return {"stored": False}
     return {
         "filename": stored.get("filename"),
-        "keywords": json.loads(stored.get("keywords") or "[]"),
+        "search_titles": json.loads(stored.get("search_titles") or "[]"),
+        "skill_signals": json.loads(stored.get("skill_signals") or "[]"),
         "email": stored.get("email"),
         "stored_at": stored.get("stored_at"),
     }
@@ -158,7 +159,8 @@ async def _run_analysis(
             if not stored:
                 raise ValueError("No stored resume found")
             resume_text = stored["text"]
-            keywords = json.loads(stored.get("keywords") or "[]")
+            search_titles = json.loads(stored.get("search_titles") or "[]")
+            skill_signals = json.loads(stored.get("skill_signals") or "[]")
             resume_tokens = {
                 t for t in re.findall(r"[a-zA-Z][a-zA-Z+#.\-]{2,}", resume_text.lower())
                 if t not in config.STOPWORDS
@@ -167,20 +169,23 @@ async def _run_analysis(
             parsed = await asyncio.to_thread(resume_parser.parse_resume, filename, content)
             resume_text = parsed["text"]
             resume_tokens = parsed["tokens"]
-            keywords = await asyncio.wait_for(
+            kw_dict = await asyncio.wait_for(
                 asyncio.to_thread(resume_parser.extract_keywords, resume_text, ai_client),
                 timeout=config.CLAUDE_TIMEOUT_SECONDS,
             )
+            search_titles = kw_dict.get("search_titles", [])
+            skill_signals = kw_dict.get("skill_signals", [])
             resume_store.save_resume(
                 filename=filename,
                 text=resume_text,
-                keywords=json.dumps(keywords),
+                search_titles=json.dumps(search_titles),
+                skill_signals=json.dumps(skill_signals),
                 email=parsed.get("email"),
                 phone=parsed.get("phone"),
             )
 
-        if not keywords:
-            keywords = ["AI Engineer", "Machine Learning Engineer"]
+        if not search_titles:
+            search_titles = ["AI Engineer", "Machine Learning Engineer"]
 
         # Steps 2-6: window retry loop — widen search until we have top_results
         windows = [hours_old] + [h for h in config.FALLBACK_HOURS if h > hours_old]
@@ -202,7 +207,7 @@ async def _run_analysis(
                     df = await asyncio.wait_for(
                         asyncio.to_thread(
                             scraper.scrape_all, location, is_remote, window, progress,
-                            search_terms=keywords,
+                            search_terms=search_titles,
                         ),
                         timeout=config.SCRAPE_TIMEOUT_SECONDS,
                     )
@@ -231,7 +236,7 @@ async def _run_analysis(
                 jobs_store.update_job(job_id, message="Scoring with AI…")
                 scored = await asyncio.wait_for(
                     asyncio.to_thread(
-                        scoring.score_with_claude, filtered, resume_text, ai_client
+                        scoring.score_with_claude, filtered, resume_text, skill_signals, ai_client
                     ),
                     timeout=config.SCRAPE_TIMEOUT_SECONDS,
                 )

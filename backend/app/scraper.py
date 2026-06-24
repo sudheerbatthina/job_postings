@@ -15,10 +15,15 @@ from . import config
 _TRANSIENT = (requests.exceptions.RequestException, ConnectionError)
 
 
+def is_specific_location(location: str) -> bool:
+    """Return True only if location looks like a real city (contains a comma)."""
+    return "," in location
+
+
 @retry(stop=stop_after_attempt(2), wait=wait_fixed(3), retry=retry_if_exception_type(_TRANSIENT))
-def _scrape_one(term: str, location: str, is_remote: bool, hours_old: int) -> pd.DataFrame:
+def _scrape_one(term: str, location: str, is_remote: bool, hours_old: int, sites: list[str]) -> pd.DataFrame:
     return scrape_jobs(
-        site_name=config.SITES,
+        site_name=sites,
         search_term=term,
         google_search_term=f"{term} jobs in {location}",
         location=location,
@@ -39,13 +44,18 @@ def scrape_all(
     on_progress: Optional[Callable[[str], None]] = None,
     search_terms: Optional[list[str]] = None,
 ) -> pd.DataFrame:
-    terms = search_terms if search_terms is not None else config.SEARCH_TERMS
+    terms = search_terms if search_terms is not None else []
+    specific = is_specific_location(location)
+    sites = config.SITES if specific else [s for s in config.SITES if s != "glassdoor"]
+    if not specific and on_progress:
+        on_progress("Skipping Glassdoor — needs a specific city, not a broad location.")
+
     frames = []
     for term in terms:
         if on_progress:
             on_progress(f"Scraping: {term}")
         try:
-            df = _scrape_one(term, location, is_remote, hours_old)
+            df = _scrape_one(term, location, is_remote, hours_old, sites)
             if df is None or df.empty:
                 continue
             df["search_term"] = term
