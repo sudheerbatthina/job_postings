@@ -11,8 +11,11 @@ Endpoints:
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import os
 import re
+
+logger = logging.getLogger(__name__)
 
 import anthropic
 import pandas as pd
@@ -187,6 +190,8 @@ async def _run_analysis(
         if not search_titles:
             search_titles = ["AI Engineer", "Machine Learning Engineer"]
 
+        logger.info("[DEBUG] search_titles=%s  skill_signals=%s", search_titles, skill_signals)
+
         # Steps 2-6: window retry loop — widen search until we have top_results
         windows = [hours_old] + [h for h in config.FALLBACK_HOURS if h > hours_old]
         # Dict keyed by job_url prevents re-scoring the same job across windows
@@ -212,11 +217,17 @@ async def _run_analysis(
                         timeout=config.SCRAPE_TIMEOUT_SECONDS,
                     )
 
+                _msg = f"[DEBUG] Scraped {len(df)} raw jobs from {window}h window"
+                logger.info(_msg)
+                jobs_store.update_job(job_id, message=_msg)
                 if df.empty:
                     continue
 
                 # Step 3: Dedup — drop jobs already returned in previous runs
                 df = await asyncio.to_thread(dedup.filter_unseen, df)
+                _msg = f"[DEBUG] {len(df)} jobs after removing already-seen"
+                logger.info(_msg)
+                jobs_store.update_job(job_id, message=_msg)
 
                 # Drop URLs already accumulated in earlier windows of this run
                 if all_scored and "job_url" in df.columns:
@@ -228,6 +239,9 @@ async def _run_analysis(
                 # Step 4: Prefilter — fast token-overlap stage
                 jobs_store.update_job(job_id, message="Filtering matches…")
                 filtered = await asyncio.to_thread(scoring.prefilter, df, resume_tokens)
+                _msg = f"[DEBUG] {len(filtered)} jobs survived keyword prefilter (of {len(df)} post-dedup)"
+                logger.info(_msg)
+                jobs_store.update_job(job_id, message=_msg)
 
                 if filtered.empty:
                     continue
@@ -240,6 +254,9 @@ async def _run_analysis(
                     ),
                     timeout=config.SCRAPE_TIMEOUT_SECONDS,
                 )
+                _msg = f"[DEBUG] {len(scored)} jobs scored by Claude"
+                logger.info(_msg)
+                jobs_store.update_job(job_id, message=_msg)
 
                 for _, row in scored.iterrows():
                     url = row.get("job_url")
@@ -250,6 +267,10 @@ async def _run_analysis(
                 jobs_store.update_job(job_id, message=f"Timed out on {window}h window — using results so far…")
                 timed_out = True
                 break
+
+        _msg = f"[DEBUG] Final: {len(all_scored)} total candidates across all windows attempted"
+        logger.info(_msg)
+        jobs_store.update_job(job_id, message=_msg)
 
         if not all_scored:
             msg = (
