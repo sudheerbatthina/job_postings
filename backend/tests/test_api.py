@@ -35,12 +35,12 @@ def _fake_scrape_all(location, is_remote, hours_old, on_progress=None, search_te
 
 
 def _fake_score_with_claude(df, resume_text, client):
-    """Returns input df with claude_score=80 for all rows, sorted descending."""
+    """Returns all rows with claude_score=80, sorted descending (no threshold, no slice)."""
     if df.empty:
         return df
     df = df.copy()
     df["claude_score"] = 80
-    return df.sort_values("claude_score", ascending=False).head(10).reset_index(drop=True)
+    return df.sort_values("claude_score", ascending=False).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +103,53 @@ def test_full_lifecycle(client):
 def test_unknown_job_returns_404(client):
     r = client.get("/api/analyze/doesnotexist")
     assert r.status_code == 404
+
+
+def test_results_sorted_by_claude_score(monkeypatch):
+    """Results must be sorted descending by claude_score even when scores are low
+    (i.e. below what used to be the 75/50 thresholds that no longer exist)."""
+
+    def low_score_claude(df, resume_text, client):
+        if df.empty:
+            return df
+        df = df.copy()
+        # Assign scores below the old 75/50 cutoffs — both should still appear
+        scores = {"http://x/1": 45, "http://x/2": 30}
+        df["claude_score"] = df["job_url"].map(scores).fillna(0).astype(int)
+        return df.sort_values("claude_score", ascending=False).reset_index(drop=True)
+
+    with TestClient(main.app) as c:
+        monkeypatch.setattr(main.scraper, "scrape_all", _fake_scrape_all)
+        monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
+        monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+        monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
+        monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
+        monkeypatch.setattr(main.resume_parser, "extract_keywords",
+                            lambda text, client: ["AI Engineer", "ML Engineer"])
+        monkeypatch.setattr(main.scoring, "score_with_claude", low_score_claude)
+
+        resume_text = b"Experienced engineer skilled in pytorch, llm, rag, langchain, aws, mlops, embeddings, python, kubernetes."
+        files = {"resume": ("resume.txt", resume_text, "text/plain")}
+        data = {"location": "United States", "is_remote": "false", "hours_old": "168"}
+
+        r = c.post("/api/analyze", files=files, data=data)
+        assert r.status_code == 200, r.text
+        job_id = r.json()["job_id"]
+
+        body = None
+        for _ in range(50):
+            r = c.get(f"/api/analyze/{job_id}")
+            body = r.json()
+            if body["status"] in ("done", "error"):
+                break
+            time.sleep(0.1)
+
+        assert body["status"] == "done", body
+        results = body["results"]
+        assert len(results) == 2, f"both jobs should appear with no score threshold, got {len(results)}"
+        assert results[0]["claude_score"] == 45
+        assert results[1]["claude_score"] == 30
+        assert results[0]["title"] == "Senior AI Engineer"
 
 
 def test_resume_reuse(monkeypatch):

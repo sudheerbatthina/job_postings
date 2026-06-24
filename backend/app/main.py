@@ -170,9 +170,10 @@ async def _run_analysis(
         if not keywords:
             keywords = ["AI Engineer", "Machine Learning Engineer"]
 
-        # Steps 2-6: window retry loop — widen search until we have 10 results
+        # Steps 2-6: window retry loop — widen search until we have top_results
         windows = [hours_old] + [h for h in config.FALLBACK_HOURS if h > hours_old]
-        all_scored = pd.DataFrame()
+        # Dict keyed by job_url prevents re-scoring the same job across windows
+        all_scored: dict[str, dict] = {}
 
         def progress(msg: str) -> None:
             jobs_store.update_job(job_id, message=msg)
@@ -204,8 +205,8 @@ async def _run_analysis(
             df = await asyncio.to_thread(dedup.filter_unseen, df)
 
             # Drop URLs already accumulated in earlier windows of this run
-            if not all_scored.empty and "job_url" in df.columns and "job_url" in all_scored.columns:
-                df = df[~df["job_url"].isin(all_scored["job_url"])].reset_index(drop=True)
+            if all_scored and "job_url" in df.columns:
+                df = df[~df["job_url"].isin(all_scored.keys())].reset_index(drop=True)
 
             if df.empty:
                 continue
@@ -217,7 +218,7 @@ async def _run_analysis(
             if filtered.empty:
                 continue
 
-            # Step 5: Claude scoring
+            # Step 5: Claude scoring — returns all rows sorted by score, no threshold
             jobs_store.update_job(job_id, message="Scoring with AI…")
             scored = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -226,30 +227,22 @@ async def _run_analysis(
                 timeout=config.SCRAPE_TIMEOUT_SECONDS,
             )
 
-            if scored.empty:
-                continue
+            for _, row in scored.iterrows():
+                url = row.get("job_url")
+                if url and url not in all_scored:
+                    all_scored[url] = row.to_dict()
 
-            all_scored = (
-                pd.concat([all_scored, scored], ignore_index=True)
-                if not all_scored.empty else scored
-            )
-
-        if all_scored.empty:
+        if not all_scored:
             jobs_store.update_job(
                 job_id, status="done",
-                message="No matching jobs found — try checking back tomorrow",
+                message="No matching jobs found — try checking back later",
                 results=[],
             )
             return
 
-        # Step 6: Assemble final top-N, re-rank
-        final = (
-            all_scored
-            .sort_values("claude_score", ascending=False)
-            .drop_duplicates("job_url")
-            .head(top_results)
-            .reset_index(drop=True)
-        )
+        # Step 6: Assemble final top-N across all windows, re-rank
+        rows = sorted(all_scored.values(), key=lambda r: r.get("claude_score", 0), reverse=True)
+        final = pd.DataFrame(rows[:top_results]).reset_index(drop=True)
         final.insert(0, "rank", range(1, len(final) + 1))
 
         # Step 7: Mark only the returned jobs as seen

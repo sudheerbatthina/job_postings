@@ -126,20 +126,15 @@ def score_with_claude(
     resume_text: str,
     client: "_anthropic.Anthropic | None",
 ) -> pd.DataFrame:
-    """Apply claude_score to each row. Filter by threshold; return top 10."""
+    """Apply claude_score to each row and return all rows sorted by score descending.
+    Slicing to TOP_RESULTS happens in the caller after accumulation across windows."""
     if df.empty:
         return df
     df = df.copy()
     df["claude_score"] = df["description"].fillna("").apply(
         lambda desc: claude_score(desc, resume_text, client)
     )
-    df = df.sort_values("claude_score", ascending=False).reset_index(drop=True)
-
-    result = df[df["claude_score"] >= config.MIN_SCORE_THRESHOLD]
-    if len(result) < 10:
-        result = df[df["claude_score"] >= config.MIN_SCORE_FALLBACK]
-
-    return result.head(10).reset_index(drop=True)
+    return df.sort_values("claude_score", ascending=False).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------

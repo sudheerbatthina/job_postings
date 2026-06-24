@@ -1,16 +1,14 @@
 """Shared constants for scraping + scoring."""
 
-SITES = ["linkedin", "indeed", "google", "zip_recruiter"]
+SITES = ["linkedin", "indeed", "google", "zip_recruiter", "glassdoor"]
 COUNTRY_INDEED = "USA"
 
 RESULTS_WANTED_PER_TERM = 25
 DEFAULT_HOURS_OLD = 24
-FALLBACK_HOURS = [72, 168]
+FALLBACK_HOURS = [72]
 
 WEIGHTS = {"keyword": 0.45, "resume": 0.25, "recency": 0.30}
 MIN_KEYWORD_SCORE = 0.10
-MIN_SCORE_THRESHOLD = 75
-MIN_SCORE_FALLBACK = 50
 TOP_RESULTS = 10
 SCRAPE_TIMEOUT_SECONDS = 120
 CLAUDE_TIMEOUT_SECONDS = 30
