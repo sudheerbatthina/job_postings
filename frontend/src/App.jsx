@@ -1,25 +1,38 @@
 import { useEffect, useRef, useState } from "react";
 import UploadForm from "./components/UploadForm";
+import ReadyToSearch from "./components/ReadyToSearch";
 import ProgressView from "./components/ProgressView";
 import ResultsTable from "./components/ResultsTable";
-import { submitResume, getJobStatus } from "./api";
+import { submitResume, getJobStatus, getStoredResume } from "./api";
 
 const POLL_INTERVAL_MS = 2000;
 const MAX_POLLS = 90; // 3 minutes at 2 s interval
 
 export default function App() {
-  const [stage, setStage] = useState("upload"); // upload | polling | done | error
+  // upload | ready | polling | done | error
+  const [stage, setStage] = useState("upload");
   const [message, setMessage] = useState("");
   const [results, setResults] = useState([]);
   const [jobId, setJobId] = useState(null);
+  const [storedResume, setStoredResume] = useState(null);
   const pollRef = useRef(null);
   const pollCountRef = useRef(0);
 
-  useEffect(() => () => clearInterval(pollRef.current), []);
+  useEffect(() => {
+    getStoredResume()
+      .then((data) => {
+        if (data.filename) {
+          setStoredResume(data);
+          setStage("ready");
+        }
+      })
+      .catch(() => {});
+    return () => clearInterval(pollRef.current);
+  }, []);
 
   const handleSubmit = async (params) => {
     setStage("polling");
-    setMessage("Uploading resume...");
+    setMessage(params.file ? "Uploading resume..." : "Starting search...");
     pollCountRef.current = 0;
     try {
       const { job_id } = await submitResume(params);
@@ -27,7 +40,11 @@ export default function App() {
       pollRef.current = setInterval(() => poll(job_id), POLL_INTERVAL_MS);
     } catch (err) {
       setStage("error");
-      setMessage(err.message);
+      if (err.status === 429) {
+        setMessage("You've hit today's search limit (4/day) — try again tomorrow.");
+      } else {
+        setMessage(err.message);
+      }
     }
   };
 
@@ -48,6 +65,10 @@ export default function App() {
         clearInterval(pollRef.current);
         setResults(data.results || []);
         setStage("done");
+        // Refresh stored resume info so "New search" goes back to ready stage
+        getStoredResume()
+          .then((d) => { if (d.filename) setStoredResume(d); })
+          .catch(() => {});
       } else if (data.status === "error") {
         clearInterval(pollRef.current);
         setStage("error");
@@ -61,15 +82,27 @@ export default function App() {
   };
 
   const reset = () => {
-    setStage("upload");
     setResults([]);
     setJobId(null);
     setMessage("");
+    setStage(storedResume ? "ready" : "upload");
+  };
+
+  const replaceResume = () => {
+    setStoredResume(null);
+    setStage("upload");
   };
 
   return (
     <div className="min-h-screen px-4 py-16">
       {stage === "upload" && <UploadForm onSubmit={handleSubmit} />}
+      {stage === "ready" && (
+        <ReadyToSearch
+          storedResume={storedResume}
+          onSubmit={handleSubmit}
+          onReplace={replaceResume}
+        />
+      )}
       {stage === "polling" && <ProgressView message={message} />}
       {stage === "done" && <ResultsTable results={results} jobId={jobId} onReset={reset} />}
       {stage === "error" && (

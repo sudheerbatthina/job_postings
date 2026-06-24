@@ -81,19 +81,28 @@ def get_resume():
 @limiter.limit("4/day")
 async def analyze(
     request: Request,
-    resume: UploadFile = File(...),
+    resume: UploadFile | None = File(None),
     location: str = Form("United States"),
     is_remote: bool = Form(False),
     hours_old: int = Form(config.DEFAULT_HOURS_OLD),
     top_results: int = Form(config.TOP_RESULTS),
 ):
-    content = await resume.read()
-    if not content:
-        raise HTTPException(400, "Empty resume file")
+    if resume is not None:
+        content: bytes | None = await resume.read()
+        filename = resume.filename or ""
+        if not content:
+            raise HTTPException(400, "Empty resume file")
+    else:
+        # No file — use stored resume (ReadyToSearch path)
+        _stored = resume_store.load_resume()
+        if not _stored:
+            raise HTTPException(400, "No resume provided and no stored resume found")
+        filename = _stored["filename"]
+        content = None  # signals _run_analysis to use stored resume directly
 
     job_id = jobs_store.create_job()
     asyncio.create_task(
-        _run_analysis(job_id, resume.filename, content, location, is_remote, hours_old, top_results)
+        _run_analysis(job_id, filename, content, location, is_remote, hours_old, top_results)
     )
     return {"job_id": job_id}
 
@@ -144,7 +153,10 @@ async def _run_analysis(
         jobs_store.update_job(job_id, status="running", message="Reading your resume")
 
         stored = resume_store.load_resume()
-        if stored and stored.get("filename") == filename:
+        if content is None or (stored and stored.get("filename") == filename):
+            # Use cached resume (no file uploaded, or same file re-uploaded)
+            if not stored:
+                raise ValueError("No stored resume found")
             resume_text = stored["text"]
             keywords = json.loads(stored.get("keywords") or "[]")
             resume_tokens = {

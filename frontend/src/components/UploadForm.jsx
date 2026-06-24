@@ -6,7 +6,6 @@ export default function UploadForm({ onSubmit }) {
   const [file, setFile] = useState(null);
   const [location, setLocation] = useState("United States");
   const [isRemote, setIsRemote] = useState(false);
-  const [hoursOld, setHoursOld] = useState(168);
 
   const onDrop = useCallback((accepted) => {
     if (accepted[0]) setFile(accepted[0]);
@@ -25,17 +24,21 @@ export default function UploadForm({ onSubmit }) {
   const handleSubmit = (e) => {
     e.preventDefault();
     if (!file) return;
-    onSubmit({ file, location, isRemote, hoursOld });
+    onSubmit({ file, location, isRemote });
   };
 
   return (
     <form onSubmit={handleSubmit} className="w-full max-w-xl mx-auto">
       <h1 className="text-2xl font-semibold tracking-tight text-stone-900">
-        Find AI engineer roles that match your resume
+        Find roles that match your resume
       </h1>
       <p className="mt-2 text-stone-600">
-        Upload your resume. We'll scrape recent AI engineer postings across LinkedIn, Indeed,
-        Google and ZipRecruiter, score each one against your resume, and rank the matches.
+        Upload your resume. We'll extract your skills, scrape recent job postings across
+        LinkedIn, Indeed, Google, ZipRecruiter, and Glassdoor, then score and rank each
+        match using AI.
+      </p>
+      <p className="mt-1 text-sm text-stone-400">
+        Searches the last 24 hours, widening to 3 days if needed.
       </p>
 
       <div
@@ -68,7 +71,7 @@ export default function UploadForm({ onSubmit }) {
         )}
       </div>
 
-      <div className="mt-6 grid grid-cols-2 gap-4">
+      <div className="mt-6">
         <label className="flex flex-col gap-1.5">
           <span className="text-sm font-medium text-stone-700">Location</span>
           <input
@@ -77,19 +80,6 @@ export default function UploadForm({ onSubmit }) {
             onChange={(e) => setLocation(e.target.value)}
             className="rounded-lg border border-stone-300 px-3 py-2 text-stone-900 focus:outline-none focus:ring-2 focus:ring-teal-700/40 focus:border-teal-700"
           />
-        </label>
-        <label className="flex flex-col gap-1.5">
-          <span className="text-sm font-medium text-stone-700">Posted within</span>
-          <select
-            value={hoursOld}
-            onChange={(e) => setHoursOld(Number(e.target.value))}
-            className="rounded-lg border border-stone-300 px-3 py-2 text-stone-900 focus:outline-none focus:ring-2 focus:ring-teal-700/40 focus:border-teal-700"
-          >
-            <option value={24}>Last 24 hours</option>
-            <option value={72}>Last 3 days</option>
-            <option value={168}>Last 7 days</option>
-            <option value={336}>Last 14 days</option>
-          </select>
         </label>
       </div>
 

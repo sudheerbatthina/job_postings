@@ -30,7 +30,7 @@ export default function ResultsTable({ results, jobId, onReset }) {
   const filtered = useMemo(
     () =>
       results
-        .filter((r) => r.score_100 >= minScore)
+        .filter((r) => (r.claude_score ?? 0) >= minScore)
         .filter((r) => !remoteOnly || r.is_remote),
     [results, minScore, remoteOnly]
   );
@@ -38,8 +38,8 @@ export default function ResultsTable({ results, jobId, onReset }) {
   if (results.length === 0) {
     return (
       <div className="w-full max-w-xl mx-auto text-center py-16">
-        <p className="text-stone-700">No matching jobs found in that window.</p>
-        <p className="mt-1 text-sm text-stone-500">Try widening the date range or removing the remote filter.</p>
+        <p className="text-stone-700">No matching jobs found right now.</p>
+        <p className="mt-1 text-sm text-stone-500">The job boards may not have new postings yet — try again in a few hours.</p>
         <button onClick={onReset} className="mt-6 text-teal-700 font-medium hover:underline">
           Try another search
         </button>
@@ -96,7 +96,7 @@ export default function ResultsTable({ results, jobId, onReset }) {
 
       <ul className="mt-4 flex flex-col gap-2">
         {filtered.map((job) => {
-          const tier = scoreTier(job.score_100);
+          const tier = scoreTier(job.claude_score);
           const salary = salaryLabel(job.min_amount, job.max_amount);
           return (
             <li
@@ -106,7 +106,7 @@ export default function ResultsTable({ results, jobId, onReset }) {
               <div
                 className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-full ring-1 ${tier.bg} ${tier.ring}`}
               >
-                <span className={`font-mono font-bold text-base ${tier.text}`}>{job.score_100}</span>
+                <span className={`font-mono font-bold text-base ${tier.text}`}>{job.claude_score}</span>
               </div>
 
               <div className="flex-1 min-w-0">
