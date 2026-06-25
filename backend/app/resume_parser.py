@@ -4,8 +4,11 @@ via Claude (or a bigram fallback if the API is unavailable)."""
 from __future__ import annotations
 import io
 import json
+import logging
 import re
 from typing import TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 from . import config
 
@@ -79,6 +82,6 @@ def extract_keywords(text: str, client: "_anthropic.Anthropic | None") -> dict:
                 }],
             )
             return json.loads(msg.content[0].text)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("extract_keywords failed: %s", e)
     return _bigram_fallback(text)

@@ -233,10 +233,7 @@ async def _run_analysis(
                     continue
 
                 # Step 3: Dedup — drop jobs already returned in previous runs.
-                # DIAGNOSTIC: set DEDUP_DISABLED=true to bypass and confirm whether
-                # dedup is the stage zeroing out results. Not a permanent change.
-                if os.environ.get("DEDUP_DISABLED", "").lower() != "true":
-                    df = await asyncio.to_thread(dedup.filter_unseen, df)
+                df = await asyncio.to_thread(dedup.filter_unseen, df)
                 trail.append(f"After dedup: {len(df)}")
                 jobs_store.update_job(job_id, message=" → ".join(trail))
                 logger.info(trail[-1])

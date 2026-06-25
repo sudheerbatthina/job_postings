@@ -41,7 +41,7 @@ def filter_unseen(df: pd.DataFrame) -> pd.DataFrame:
         return df
     with _conn() as con:
         # Prune rows older than 24 hours before querying
-        con.execute("DELETE FROM seen_jobs WHERE seen_at < datetime('now', '-1 day')")
+        con.execute("DELETE FROM seen_jobs WHERE datetime(seen_at) < datetime('now', '-1 day')")
         con.commit()
         urls = tuple(df["job_url"].dropna().unique())
         if not urls:
@@ -59,7 +59,7 @@ def filter_unseen(df: pd.DataFrame) -> pd.DataFrame:
 def mark_seen(df: pd.DataFrame) -> None:
     if df.empty or "job_url" not in df.columns:
         return
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     rows = [(url, now) for url in df["job_url"].dropna().unique()]
     if not rows:
         return

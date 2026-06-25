@@ -8,10 +8,13 @@ The legacy score_and_rank() is kept for reference / CLI use.
 
 from __future__ import annotations
 import json
+import logging
 import re
 import math
 from datetime import date, datetime
 from typing import TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 import pandas as pd
 
@@ -131,7 +134,8 @@ def claude_score(
         )
         data = json.loads(msg.content[0].text)
         return int(data["score"])
-    except Exception:
+    except Exception as e:
+        logger.warning("claude_score failed: %s", e)
         return 0
 
 
