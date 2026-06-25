@@ -54,7 +54,7 @@ def _bigram_fallback(text: str) -> dict:
         bg = f"{words[i]} {words[i + 1]}"
         counts[bg] = counts.get(bg, 0) + 1
     titles = [bg for bg, _ in sorted(counts.items(), key=lambda x: -x[1])[:6]]
-    return {"search_titles": titles, "skill_signals": []}
+    return {"search_titles": titles, "skill_signals": [], "total_yoe": 0}
 
 
 def extract_keywords(text: str, client: "_anthropic.Anthropic | None") -> dict:
@@ -69,14 +69,15 @@ def extract_keywords(text: str, client: "_anthropic.Anthropic | None") -> dict:
                 messages=[{
                     "role": "user",
                     "content": (
-                        "From this resume, return JSON with two arrays:\n"
+                        "From this resume, return JSON with three fields:\n"
                         "search_titles: 4-6 generic, job-board-searchable role titles this person is "
                         "qualified for (e.g. 'AI Engineer', 'Senior Machine Learning Engineer') — these "
                         "get typed into a job board search box, so they must look like real job titles, "
                         "not skill names.\n"
                         "skill_signals: 6-10 specific technical phrases that differentiate this candidate "
                         "(e.g. 'RAG', 'LangGraph', 'agentic AI', 'MCP') — used for scoring fit, not for searching.\n"
-                        'Return only valid JSON: {"search_titles": [...], "skill_signals": [...]}\n\n'
+                        "total_yoe: integer total years of professional work experience (0 if unclear).\n"
+                        'Return only valid JSON: {"search_titles": [...], "skill_signals": [...], "total_yoe": <int>}\n\n'
                         + text[:3000]
                     ),
                 }],

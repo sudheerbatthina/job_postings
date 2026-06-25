@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { ExternalLink, Download, RotateCcw } from "lucide-react";
+import { ExternalLink, Download, RotateCcw, ChevronDown, ChevronUp } from "lucide-react";
 import { exportUrl } from "../api";
 
 function scoreTier(score) {
@@ -8,9 +8,16 @@ function scoreTier(score) {
   return { bg: "bg-stone-100", text: "text-stone-600", ring: "ring-stone-400/30" };
 }
 
-function relativeDate(dateStr) {
+function relativeTime(dateStr) {
   if (!dateStr) return "Unknown date";
-  const days = Math.floor((Date.now() - new Date(dateStr).getTime()) / 86400000);
+  const hasTime = dateStr.includes("T");
+  const diff = Date.now() - new Date(dateStr).getTime();
+  if (hasTime) {
+    const hours = Math.floor(diff / 3600000);
+    if (hours < 1) return "Just now";
+    if (hours < 24) return `${hours}h ago`;
+  }
+  const days = Math.floor(diff / 86400000);
   if (days <= 0) return "Today";
   if (days === 1) return "Yesterday";
   return `${days} days ago`;
@@ -26,11 +33,12 @@ function salaryLabel(min, max) {
 export default function ResultsTable({ results, jobId, onReset }) {
   const [minScore, setMinScore] = useState(0);
   const [remoteOnly, setRemoteOnly] = useState(false);
+  const [expandedUrl, setExpandedUrl] = useState(null);
 
   const filtered = useMemo(
     () =>
       results
-        .filter((r) => (r.claude_score ?? 0) >= minScore)
+        .filter((r) => (r.ats_score ?? 0) >= minScore)
         .filter((r) => !remoteOnly || r.is_remote),
     [results, minScore, remoteOnly]
   );
@@ -96,35 +104,67 @@ export default function ResultsTable({ results, jobId, onReset }) {
 
       <ul className="mt-4 flex flex-col gap-2">
         {filtered.map((job) => {
-          const tier = scoreTier(job.claude_score);
+          const tier = scoreTier(job.ats_score);
           const salary = salaryLabel(job.min_amount, job.max_amount);
+          const missing = job.missing_keywords || [];
+          const isExpanded = expandedUrl === job.job_url;
           return (
             <li
               key={job.job_url}
-              className="flex items-center gap-4 rounded-lg border border-stone-200 bg-white px-4 py-3"
+              className="rounded-lg border border-stone-200 bg-white"
             >
-              <div
-                className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-full ring-1 ${tier.bg} ${tier.ring}`}
-              >
-                <span className={`font-mono font-bold text-base ${tier.text}`}>{job.claude_score}</span>
+              <div className="flex items-center gap-4 px-4 py-3">
+                <div
+                  className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-full ring-1 ${tier.bg} ${tier.ring}`}
+                >
+                  <span className={`font-mono font-bold text-base ${tier.text}`}>{job.ats_score}</span>
+                </div>
+
+                <div className="flex-1 min-w-0">
+                  <p className="font-medium text-stone-900 truncate">{job.title}</p>
+                  <p className="text-sm text-stone-500 truncate">
+                    {job.company} · {job.location} · {relativeTime(job.date_posted)}
+                    {salary ? ` · ${salary}` : ""}
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  {missing.length > 0 && (
+                    <button
+                      onClick={() => setExpandedUrl(isExpanded ? null : job.job_url)}
+                      className="flex items-center gap-1 text-xs text-stone-400 hover:text-stone-600"
+                      title="Why this score?"
+                    >
+                      {isExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                      Why?
+                    </button>
+                  )}
+                  <a
+                    href={job.job_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-1.5 rounded-md bg-stone-900 px-3 py-2 text-sm font-medium text-white hover:bg-stone-700"
+                  >
+                    Apply <ExternalLink size={13} />
+                  </a>
+                </div>
               </div>
 
-              <div className="flex-1 min-w-0">
-                <p className="font-medium text-stone-900 truncate">{job.title}</p>
-                <p className="text-sm text-stone-500 truncate">
-                  {job.company} · {job.location} · {relativeDate(job.date_posted)}
-                  {salary ? ` · ${salary}` : ""}
-                </p>
-              </div>
-
-              <a
-                href={job.job_url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-1.5 shrink-0 rounded-md bg-stone-900 px-3 py-2 text-sm font-medium text-white hover:bg-stone-700"
-              >
-                Apply <ExternalLink size={13} />
-              </a>
+              {isExpanded && missing.length > 0 && (
+                <div className="border-t border-stone-100 px-4 pb-3 pt-2">
+                  <p className="mb-2 text-xs font-medium text-stone-500">Missing keywords</p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {missing.map((kw) => (
+                      <span
+                        key={kw}
+                        className="rounded-full bg-red-50 px-2.5 py-0.5 text-xs font-medium text-red-700 ring-1 ring-red-200"
+                      >
+                        {kw}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
             </li>
           );
         })}

@@ -76,6 +76,7 @@ def get_resume():
         "filename": stored.get("filename"),
         "search_titles": json.loads(stored.get("search_titles") or "[]"),
         "skill_signals": json.loads(stored.get("skill_signals") or "[]"),
+        "total_yoe": stored.get("total_yoe") or 0,
         "email": stored.get("email"),
         "stored_at": stored.get("stored_at"),
     }
@@ -164,6 +165,7 @@ async def _run_analysis(
             resume_text = stored["text"]
             search_titles = json.loads(stored.get("search_titles") or "[]")
             skill_signals = json.loads(stored.get("skill_signals") or "[]")
+            total_yoe = int(stored.get("total_yoe") or 0)
             resume_tokens = {
                 t for t in re.findall(r"[a-zA-Z][a-zA-Z+#.\-]{2,}", resume_text.lower())
                 if t not in config.STOPWORDS
@@ -178,11 +180,13 @@ async def _run_analysis(
             )
             search_titles = kw_dict.get("search_titles", [])
             skill_signals = kw_dict.get("skill_signals", [])
+            total_yoe = int(kw_dict.get("total_yoe") or 0)
             resume_store.save_resume(
                 filename=filename,
                 text=resume_text,
                 search_titles=json.dumps(search_titles),
                 skill_signals=json.dumps(skill_signals),
+                total_yoe=total_yoe,
                 email=parsed.get("email"),
                 phone=parsed.get("phone"),
             )
@@ -260,7 +264,7 @@ async def _run_analysis(
                 )
                 scored = await asyncio.wait_for(
                     asyncio.to_thread(
-                        scoring.score_with_claude, filtered, resume_text, skill_signals, ai_client
+                        scoring.score_with_claude, filtered, resume_text, skill_signals, total_yoe, ai_client
                     ),
                     timeout=config.SCRAPE_TIMEOUT_SECONDS,
                 )
@@ -292,7 +296,7 @@ async def _run_analysis(
             return
 
         # Step 6: Assemble final top-N across all windows, re-rank
-        rows = sorted(all_scored.values(), key=lambda r: r.get("claude_score", 0), reverse=True)
+        rows = sorted(all_scored.values(), key=lambda r: r.get("ats_score", 0), reverse=True)
         final = pd.DataFrame(rows[:top_results]).reset_index(drop=True)
         final.insert(0, "rank", range(1, len(final) + 1))
 

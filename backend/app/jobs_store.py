@@ -7,6 +7,7 @@ import asyncio
 import math
 import time
 import uuid
+from datetime import date, datetime
 from typing import Optional
 
 import pandas as pd
@@ -43,6 +44,10 @@ def get_job(job_id: str) -> Optional[dict]:
 def _sanitize(val):
     if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
         return None
+    if isinstance(val, pd.Timestamp):
+        return None if pd.isna(val) else val.isoformat()
+    if isinstance(val, (datetime, date)):
+        return val.isoformat()
     return val
 
 

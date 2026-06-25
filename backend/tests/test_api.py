@@ -45,16 +45,17 @@ def _fake_scrape_all(location, is_remote, hours_old, on_progress=None, search_te
     return df
 
 
-_FAKE_KW = {"search_titles": ["AI Engineer", "ML Engineer"], "skill_signals": ["RAG", "LangChain"]}
+_FAKE_KW = {"search_titles": ["AI Engineer", "ML Engineer"], "skill_signals": ["RAG", "LangChain"], "total_yoe": 5}
 
 
-def _fake_score_with_claude(df, resume_text, skill_signals, client):
-    """Returns all rows with claude_score=80, sorted descending (no threshold, no slice)."""
+def _fake_score_with_claude(df, resume_text, skill_signals, total_yoe, client):
+    """Returns all rows with ats_score=80, sorted descending (no threshold, no slice)."""
     if df.empty:
         return df
     df = df.copy()
-    df["claude_score"] = 80
-    return df.sort_values("claude_score", ascending=False).reset_index(drop=True)
+    df["ats_score"] = 80
+    df["missing_keywords"] = [[] for _ in range(len(df))]
+    return df.sort_values("ats_score", ascending=False).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -119,18 +120,19 @@ def test_unknown_job_returns_404(client):
     assert r.status_code == 404
 
 
-def test_results_sorted_by_claude_score(monkeypatch):
-    """Results must be sorted descending by claude_score even when scores are low
+def test_results_sorted_by_ats_score(monkeypatch):
+    """Results must be sorted descending by ats_score even when scores are low
     (i.e. below what used to be the 75/50 thresholds that no longer exist)."""
 
-    def low_score_claude(df, resume_text, skill_signals, client):
+    def low_score_claude(df, resume_text, skill_signals, total_yoe, client):
         if df.empty:
             return df
         df = df.copy()
         # Assign scores below the old 75/50 cutoffs — both should still appear
         scores = {"http://x/1": 45, "http://x/2": 30}
-        df["claude_score"] = df["job_url"].map(scores).fillna(0).astype(int)
-        return df.sort_values("claude_score", ascending=False).reset_index(drop=True)
+        df["ats_score"] = df["job_url"].map(scores).fillna(0).astype(int)
+        df["missing_keywords"] = [[] for _ in range(len(df))]
+        return df.sort_values("ats_score", ascending=False).reset_index(drop=True)
 
     with TestClient(main.app) as c:
         monkeypatch.setattr(main.scraper, "scrape_all", _fake_scrape_all)
@@ -161,8 +163,8 @@ def test_results_sorted_by_claude_score(monkeypatch):
         assert body["status"] == "done", body
         results = body["results"]
         assert len(results) == 2, f"both jobs should appear with no score threshold, got {len(results)}"
-        assert results[0]["claude_score"] == 45
-        assert results[1]["claude_score"] == 30
+        assert results[0]["ats_score"] == 45
+        assert results[1]["ats_score"] == 30
         assert results[0]["title"] == "Senior AI Engineer"
 
 
@@ -185,6 +187,7 @@ def test_resume_reuse(monkeypatch):
                 "text": stored_resume["text"],
                 "search_titles": stored_resume.get("search_titles", "[]"),
                 "skill_signals": stored_resume.get("skill_signals", "[]"),
+                "total_yoe": stored_resume.get("total_yoe", 0),
                 "email": stored_resume.get("email"),
                 "phone": stored_resume.get("phone"),
             }
@@ -275,6 +278,40 @@ def test_timeout_mid_loop_returns_partial_results(monkeypatch):
     results = body["results"]
     assert len(results) >= 1, "Should have results from the first (non-timed-out) window"
     assert "cut short" in body["message"], f"Message should note partial results: {body['message']}"
+
+
+def test_yoe_extracted_and_stored(monkeypatch):
+    """total_yoe returned by extract_keywords must be passed to save_resume."""
+    stored = {}
+
+    def fake_save_resume(**kw):
+        stored.update(kw)
+
+    monkeypatch.setattr(main.scraper, "scrape_all", _fake_scrape_all)
+    monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
+    monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+    monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
+    monkeypatch.setattr(main.resume_store, "save_resume", fake_save_resume)
+    monkeypatch.setattr(main.resume_parser, "extract_keywords",
+                        lambda text, client: {**_FAKE_KW, "total_yoe": 7})
+    monkeypatch.setattr(main.scoring, "score_with_claude", _fake_score_with_claude)
+
+    resume_bytes = b"7 years of experience with pytorch, llm, rag, langchain, aws."
+    files = {"resume": ("resume.txt", resume_bytes, "text/plain")}
+    data = {"location": "United States", "is_remote": "false"}
+
+    with TestClient(main.app) as c:
+        r = c.post("/api/analyze", files=files, data=data)
+        assert r.status_code == 200, r.text
+        job_id = r.json()["job_id"]
+        for _ in range(50):
+            body = c.get(f"/api/analyze/{job_id}").json()
+            if body["status"] in ("done", "error"):
+                break
+            time.sleep(0.1)
+
+    assert body["status"] == "done", body
+    assert stored.get("total_yoe") == 7, f"expected total_yoe=7 in save_resume call, got: {stored}"
 
 
 def test_glassdoor_location_filtering(monkeypatch):

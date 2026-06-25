@@ -100,60 +100,81 @@ def prefilter(df: pd.DataFrame, resume_tokens: set[str]) -> pd.DataFrame:
 # Stage 2: Claude scoring
 # ---------------------------------------------------------------------------
 
+_SCORE_EMPTY: dict = {"ats_score": 0, "missing_keywords": []}
+
+
 def claude_score(
     job_description: str,
     resume_text: str,
     skill_signals: list[str],
+    total_yoe: int,
     client: "_anthropic.Anthropic | None",
-) -> int:
-    """Ask Claude Haiku to score resume↔job fit on 0-100. Returns 0 on any failure."""
+) -> dict:
+    """Ask Claude Haiku to ATS-score resume↔job fit.
+    Returns {"ats_score": 0-100, "missing_keywords": [...]}; all-zero on any failure."""
     if client is None:
-        return 0
-    signals_note = ""
-    if skill_signals:
-        signals_str = ", ".join(skill_signals)
-        signals_note = (
-            f"This candidate's key differentiating skills are: {signals_str}. "
-            "Weigh how well the job description matches these specifically, "
-            "not just generic ML/AI terms.\n"
-        )
+        return _SCORE_EMPTY
+    yoe_note = (
+        f"The candidate has approximately {total_yoe} year{'s' if total_yoe != 1 else ''} "
+        "of professional experience. "
+        if total_yoe
+        else ""
+    )
+    signals_note = (
+        f"Candidate's key differentiating skills: {', '.join(skill_signals)}.\n"
+        if skill_signals
+        else ""
+    )
     try:
         msg = client.messages.create(
             model="claude-haiku-4-5",
-            max_tokens=50,
+            max_tokens=200,
             messages=[{
                 "role": "user",
                 "content": (
-                    'Score how well this resume matches this job description. '
-                    'Return only a JSON object: {"score": <0-100>}.\n'
+                    "You are an ATS. Score this resume against the job description (0-100) "
+                    "and list must-have skills from the JD that are absent from the resume.\n\n"
+                    "Scoring factors:\n"
+                    "- Skill/keyword coverage: does the resume mention the JD's required technologies?\n"
+                    "- Must-have requirements: are the JD's explicit required qualifications present?\n"
+                    "- Title alignment: does the candidate's background match this role's level and focus?\n"
+                    f"- Seniority fit: {yoe_note}does the experience level match the role?\n"
                     + signals_note
-                    + f"Resume: {resume_text[:2000]}\n"
-                    + f"Job: {job_description[:1500]}"
+                    + "\nReturn ONLY valid JSON:\n"
+                    '{"ats_score": <0-100>, "missing_keywords": [<JD must-have skills absent from resume>]}\n\n'
+                    f"Resume:\n{resume_text[:2000]}\n\n"
+                    f"Job description:\n{job_description[:1500]}"
                 ),
             }],
         )
         data = json.loads(msg.content[0].text)
-        return int(data["score"])
+        return {
+            "ats_score": int(data["ats_score"]),
+            "missing_keywords": [str(k) for k in data.get("missing_keywords", [])],
+        }
     except Exception as e:
         logger.warning("claude_score failed: %s", e)
-        return 0
+        return _SCORE_EMPTY
 
 
 def score_with_claude(
     df: pd.DataFrame,
     resume_text: str,
     skill_signals: list[str],
+    total_yoe: int,
     client: "_anthropic.Anthropic | None",
 ) -> pd.DataFrame:
-    """Apply claude_score to each row and return all rows sorted by score descending.
+    """Apply claude_score to each row; return all rows sorted by ats_score descending.
     Slicing to TOP_RESULTS happens in the caller after accumulation across windows."""
     if df.empty:
         return df
     df = df.copy()
-    df["claude_score"] = df["description"].fillna("").apply(
-        lambda desc: claude_score(desc, resume_text, skill_signals, client)
+    scored = df["description"].fillna("").apply(
+        lambda desc: claude_score(desc, resume_text, skill_signals, total_yoe, client)
     )
-    return df.sort_values("claude_score", ascending=False).reset_index(drop=True)
+    df["ats_score"] = scored.apply(lambda r: r["ats_score"])
+    df["missing_keywords"] = scored.apply(lambda r: r["missing_keywords"])
+    return df.sort_values("ats_score", ascending=False).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------

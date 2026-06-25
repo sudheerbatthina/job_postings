@@ -7,12 +7,12 @@ import pandas as pd
 from openpyxl.utils import get_column_letter
 
 
-COLUMN_ORDER = ["rank", "score_100", "title", "company", "location",
+COLUMN_ORDER = ["rank", "ats_score", "title", "company", "location",
                 "date_posted", "is_remote", "min_amount", "max_amount",
-                "job_url", "search_term"]
+                "missing_keywords", "job_url", "search_term"]
 
 RENAME = {
-    "score_100": "score", "min_amount": "salary_min",
+    "ats_score": "score", "min_amount": "salary_min",
     "max_amount": "salary_max", "job_url": "apply_url",
 }
 

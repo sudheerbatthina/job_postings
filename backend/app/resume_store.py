@@ -29,16 +29,17 @@ def _conn():
                 text          TEXT,
                 search_titles TEXT,
                 skill_signals TEXT,
+                total_yoe     INTEGER DEFAULT 0,
                 email         TEXT,
                 phone         TEXT,
                 stored_at     TEXT
             )
         """)
         con.commit()
-        # Migrate old DBs that have the legacy `keywords` column but not the new ones
-        for col in ("search_titles", "skill_signals"):
+        # Migrate old DBs that are missing newer columns
+        for col, typedef in (("search_titles", "TEXT"), ("skill_signals", "TEXT"), ("total_yoe", "INTEGER DEFAULT 0")):
             try:
-                con.execute(f"ALTER TABLE resume ADD COLUMN {col} TEXT")
+                con.execute(f"ALTER TABLE resume ADD COLUMN {col} {typedef}")
                 con.commit()
             except sqlite3.OperationalError:
                 pass  # column already exists
@@ -54,14 +55,15 @@ def save_resume(
     skill_signals: str,
     email: str | None,
     phone: str | None,
+    total_yoe: int = 0,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as con:
         con.execute("DELETE FROM resume")
         con.execute(
-            "INSERT INTO resume (filename, text, search_titles, skill_signals, email, phone, stored_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (filename, text, search_titles, skill_signals, email, phone, now),
+            "INSERT INTO resume (filename, text, search_titles, skill_signals, total_yoe, email, phone, stored_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (filename, text, search_titles, skill_signals, total_yoe, email, phone, now),
         )
         con.commit()
 
