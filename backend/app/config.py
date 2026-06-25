@@ -5,7 +5,20 @@ COUNTRY_INDEED = "USA"
 
 RESULTS_WANTED_PER_TERM = 25
 DEFAULT_HOURS_OLD = 24
-FALLBACK_HOURS = [72]
+FALLBACK_HOURS = [72, 168, 336]
+RESUME_ANALYSIS_VERSION = 2
+PREFILTER_BYPASS_LIMIT = 25
+
+DEFAULT_SEARCH_TITLES = [
+    "AI Engineer",
+    "Machine Learning Engineer",
+    "GenAI Engineer",
+    "Applied AI Engineer",
+    "LLM Engineer",
+    "Data Scientist",
+    "Applied Scientist",
+    "ML Platform Engineer",
+]
 
 WEIGHTS = {"keyword": 0.45, "resume": 0.25, "recency": 0.30}
 MIN_KEYWORD_SCORE = 0.10

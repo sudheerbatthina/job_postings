@@ -5,7 +5,7 @@ export default function ReadyToSearch({ storedResume, onSubmit, onReplace }) {
   const [location, setLocation] = useState("United States");
   const [isRemote, setIsRemote] = useState(false);
 
-  const keywords = storedResume?.keywords || [];
+  const searchTitles = storedResume?.search_titles || [];
 
   const handleSubmit = (e) => {
     e.preventDefault();
@@ -23,14 +23,14 @@ export default function ReadyToSearch({ storedResume, onSubmit, onReplace }) {
         <span className="text-sm">Using saved resume: <span className="font-medium text-stone-800">{storedResume?.filename}</span></span>
       </div>
 
-      {keywords.length > 0 && (
+      {searchTitles.length > 0 && (
         <div className="mt-4 flex flex-wrap gap-2">
-          {keywords.map((kw) => (
+          {searchTitles.map((title) => (
             <span
-              key={kw}
+              key={title}
               className="rounded-full bg-teal-50 px-3 py-1 text-xs font-medium text-teal-800 ring-1 ring-teal-700/20"
             >
-              {kw}
+              {title}
             </span>
           ))}
         </div>

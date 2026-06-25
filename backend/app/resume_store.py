@@ -3,11 +3,12 @@ can skip re-parsing and re-extracting keywords when the same file is
 re-uploaded. Shares the SQLite DB file with dedup (DEDUP_DB_PATH env var)."""
 
 from __future__ import annotations
-import json
 import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
+
+from . import config
 
 _DB_PATH = os.environ.get("DEDUP_DB_PATH", "/data/seen_jobs.db")
 try:
@@ -29,6 +30,7 @@ def _conn():
                 text          TEXT,
                 search_titles TEXT,
                 skill_signals TEXT,
+                analysis_version INTEGER DEFAULT 0,
                 total_yoe     INTEGER DEFAULT 0,
                 email         TEXT,
                 phone         TEXT,
@@ -37,7 +39,12 @@ def _conn():
         """)
         con.commit()
         # Migrate old DBs that are missing newer columns
-        for col, typedef in (("search_titles", "TEXT"), ("skill_signals", "TEXT"), ("total_yoe", "INTEGER DEFAULT 0")):
+        for col, typedef in (
+            ("search_titles", "TEXT"),
+            ("skill_signals", "TEXT"),
+            ("analysis_version", "INTEGER DEFAULT 0"),
+            ("total_yoe", "INTEGER DEFAULT 0"),
+        ):
             try:
                 con.execute(f"ALTER TABLE resume ADD COLUMN {col} {typedef}")
                 con.commit()
@@ -56,14 +63,19 @@ def save_resume(
     email: str | None,
     phone: str | None,
     total_yoe: int = 0,
+    analysis_version: int = config.RESUME_ANALYSIS_VERSION,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as con:
         con.execute("DELETE FROM resume")
         con.execute(
-            "INSERT INTO resume (filename, text, search_titles, skill_signals, total_yoe, email, phone, stored_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (filename, text, search_titles, skill_signals, total_yoe, email, phone, now),
+            "INSERT INTO resume "
+            "(filename, text, search_titles, skill_signals, analysis_version, total_yoe, email, phone, stored_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                filename, text, search_titles, skill_signals, analysis_version,
+                total_yoe, email, phone, now,
+            ),
         )
         con.commit()
 

@@ -100,7 +100,50 @@ def prefilter(df: pd.DataFrame, resume_tokens: set[str]) -> pd.DataFrame:
 # Stage 2: Claude scoring
 # ---------------------------------------------------------------------------
 
-_SCORE_EMPTY: dict = {"ats_score": 0, "missing_keywords": []}
+_SCORE_FAILED: dict = {"ats_score": None, "missing_keywords": [], "used_fallback_score": True}
+
+
+def fallback_score_row(row, resume_tokens: set[str] | None, window_hours: int) -> int:
+    """Cheap non-AI score so Claude/API failures still return ranked jobs."""
+    title = row.get("title", "") if hasattr(row, "get") else ""
+    desc = row.get("description", "") if hasattr(row, "get") else ""
+    date_posted = row.get("date_posted") if hasattr(row, "get") else None
+    kw = keyword_score(title, desc)
+    resume = resume_score(desc, resume_tokens or set())
+    recency = recency_score(date_posted, window_hours)
+    score = 100 * (0.45 * kw + 0.35 * resume + 0.20 * recency)
+    return max(0, min(100, int(round(score))))
+
+
+def sort_scored(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    if "date_posted" not in df.columns:
+        df["date_posted"] = None
+    df["_sort_date"] = pd.to_datetime(df["date_posted"], errors="coerce")
+    df = df.sort_values(
+        ["ats_score", "_sort_date"],
+        ascending=[False, False],
+        na_position="last",
+    )
+    return df.drop(columns=["_sort_date"]).reset_index(drop=True)
+
+
+def fallback_score_dataframe(
+    df: pd.DataFrame,
+    resume_tokens: set[str] | None,
+    window_hours: int,
+) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    df["ats_score"] = df.apply(
+        lambda row: fallback_score_row(row, resume_tokens, window_hours), axis=1
+    )
+    df["missing_keywords"] = [[] for _ in range(len(df))]
+    df["used_fallback_score"] = True
+    return sort_scored(df)
 
 
 def claude_score(
@@ -113,7 +156,7 @@ def claude_score(
     """Ask Claude Haiku to ATS-score resume↔job fit.
     Returns {"ats_score": 0-100, "missing_keywords": [...]}; all-zero on any failure."""
     if client is None:
-        return _SCORE_EMPTY
+        return _SCORE_FAILED
     yoe_note = (
         f"The candidate has approximately {total_yoe} year{'s' if total_yoe != 1 else ''} "
         "of professional experience. "
@@ -154,7 +197,7 @@ def claude_score(
         }
     except Exception as e:
         logger.warning("claude_score failed: %s", e)
-        return _SCORE_EMPTY
+        return _SCORE_FAILED
 
 
 def score_with_claude(
@@ -163,18 +206,37 @@ def score_with_claude(
     skill_signals: list[str],
     total_yoe: int,
     client: "_anthropic.Anthropic | None",
+    resume_tokens: set[str] | None = None,
+    window_hours: int = config.DEFAULT_HOURS_OLD,
 ) -> pd.DataFrame:
     """Apply claude_score to each row; return all rows sorted by ats_score descending.
     Slicing to TOP_RESULTS happens in the caller after accumulation across windows."""
     if df.empty:
         return df
     df = df.copy()
-    scored = df["description"].fillna("").apply(
-        lambda desc: claude_score(desc, resume_text, skill_signals, total_yoe, client)
-    )
-    df["ats_score"] = scored.apply(lambda r: r["ats_score"])
-    df["missing_keywords"] = scored.apply(lambda r: r["missing_keywords"])
-    return df.sort_values("ats_score", ascending=False).reset_index(drop=True)
+    scores = []
+    missing_keywords = []
+    fallback_flags = []
+    for _, row in df.iterrows():
+        result = claude_score(
+            row.get("description") or "",
+            resume_text,
+            skill_signals,
+            total_yoe,
+            client,
+        )
+        if result.get("ats_score") is None:
+            scores.append(fallback_score_row(row, resume_tokens, window_hours))
+            missing_keywords.append([])
+            fallback_flags.append(True)
+        else:
+            scores.append(max(0, min(100, int(result["ats_score"]))))
+            missing_keywords.append([str(k) for k in result.get("missing_keywords", [])])
+            fallback_flags.append(False)
+    df["ats_score"] = scores
+    df["missing_keywords"] = missing_keywords
+    df["used_fallback_score"] = fallback_flags
+    return sort_scored(df)
 
 
 # ---------------------------------------------------------------------------

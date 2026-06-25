@@ -72,11 +72,16 @@ def get_resume():
     stored = resume_store.load_resume()
     if not stored:
         return {"stored": False}
-    return {
-        "filename": stored.get("filename"),
+    analysis = resume_parser.normalize_resume_analysis({
         "search_titles": json.loads(stored.get("search_titles") or "[]"),
         "skill_signals": json.loads(stored.get("skill_signals") or "[]"),
         "total_yoe": stored.get("total_yoe") or 0,
+    })
+    return {
+        "filename": stored.get("filename"),
+        "search_titles": analysis["search_titles"],
+        "skill_signals": analysis["skill_signals"],
+        "total_yoe": analysis["total_yoe"],
         "email": stored.get("email"),
         "stored_at": stored.get("stored_at"),
     }
@@ -144,10 +149,52 @@ def export_xlsx(job_id: str):
 # Background pipeline
 # ---------------------------------------------------------------------------
 
+def _resume_tokens_from_text(resume_text: str) -> set[str]:
+    return {
+        t for t in re.findall(r"[a-zA-Z][a-zA-Z+#.\-]{2,}", resume_text.lower())
+        if t not in config.STOPWORDS
+    }
+
+
+def _cache_analysis_version(stored: dict | None) -> int:
+    if not stored:
+        return 0
+    try:
+        return int(stored.get("analysis_version") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _cache_analysis_current(stored: dict | None) -> bool:
+    return _cache_analysis_version(stored) >= config.RESUME_ANALYSIS_VERSION
+
+
+def _stored_search_titles(stored: dict | None) -> list[str]:
+    if not stored:
+        return []
+    try:
+        return json.loads(stored.get("search_titles") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+
+
+def _cache_analysis_valid(stored: dict | None) -> bool:
+    return len(resume_parser.sanitize_search_titles(_stored_search_titles(stored))) >= 3
+
+
+def _recent_shortlist(df: pd.DataFrame, limit: int) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    if "date_posted" not in df.columns:
+        df["date_posted"] = None
+    return df.sort_values("date_posted", ascending=False, na_position="last").head(limit).reset_index(drop=True)
+
+
 async def _run_analysis(
     job_id: str,
     filename: str,
-    content: bytes,
+    content: bytes | None,
     location: str,
     is_remote: bool,
     hours_old: int,
@@ -159,17 +206,36 @@ async def _run_analysis(
 
         stored = resume_store.load_resume()
         if content is None or (stored and stored.get("filename") == filename):
-            # Use cached resume (no file uploaded, or same file re-uploaded)
+            # Use stored resume text. Re-run analysis if its cached schema/prompt is stale.
             if not stored:
                 raise ValueError("No stored resume found")
             resume_text = stored["text"]
-            search_titles = json.loads(stored.get("search_titles") or "[]")
-            skill_signals = json.loads(stored.get("skill_signals") or "[]")
-            total_yoe = int(stored.get("total_yoe") or 0)
-            resume_tokens = {
-                t for t in re.findall(r"[a-zA-Z][a-zA-Z+#.\-]{2,}", resume_text.lower())
-                if t not in config.STOPWORDS
-            }
+            resume_tokens = _resume_tokens_from_text(resume_text)
+            if _cache_analysis_current(stored) and _cache_analysis_valid(stored):
+                kw_dict = resume_parser.normalize_resume_analysis({
+                    "search_titles": _stored_search_titles(stored),
+                    "skill_signals": json.loads(stored.get("skill_signals") or "[]"),
+                    "total_yoe": stored.get("total_yoe") or 0,
+                })
+            else:
+                kw_dict = await asyncio.wait_for(
+                    asyncio.to_thread(resume_parser.extract_keywords, resume_text, ai_client),
+                    timeout=config.CLAUDE_TIMEOUT_SECONDS,
+                )
+                kw_dict = resume_parser.normalize_resume_analysis(kw_dict)
+                resume_store.save_resume(
+                    filename=stored.get("filename") or filename,
+                    text=resume_text,
+                    search_titles=json.dumps(kw_dict["search_titles"]),
+                    skill_signals=json.dumps(kw_dict["skill_signals"]),
+                    total_yoe=kw_dict["total_yoe"],
+                    email=stored.get("email"),
+                    phone=stored.get("phone"),
+                    analysis_version=config.RESUME_ANALYSIS_VERSION,
+                )
+            search_titles = kw_dict["search_titles"]
+            skill_signals = kw_dict["skill_signals"]
+            total_yoe = kw_dict["total_yoe"]
         else:
             parsed = await asyncio.to_thread(resume_parser.parse_resume, filename, content)
             resume_text = parsed["text"]
@@ -178,6 +244,7 @@ async def _run_analysis(
                 asyncio.to_thread(resume_parser.extract_keywords, resume_text, ai_client),
                 timeout=config.CLAUDE_TIMEOUT_SECONDS,
             )
+            kw_dict = resume_parser.normalize_resume_analysis(kw_dict)
             search_titles = kw_dict.get("search_titles", [])
             skill_signals = kw_dict.get("skill_signals", [])
             total_yoe = int(kw_dict.get("total_yoe") or 0)
@@ -189,15 +256,22 @@ async def _run_analysis(
                 total_yoe=total_yoe,
                 email=parsed.get("email"),
                 phone=parsed.get("phone"),
+                analysis_version=config.RESUME_ANALYSIS_VERSION,
             )
 
-        if not search_titles:
-            search_titles = ["AI Engineer", "Machine Learning Engineer"]
+        normalized_analysis = resume_parser.normalize_resume_analysis({
+            "search_titles": search_titles,
+            "skill_signals": skill_signals,
+            "total_yoe": total_yoe,
+        })
+        search_titles = normalized_analysis["search_titles"]
+        skill_signals = normalized_analysis["skill_signals"]
+        total_yoe = normalized_analysis["total_yoe"]
 
         # Accumulated stage trail — appended after each pipeline step and pushed
         # to the job message so the full path is visible in the frontend without
         # needing Railway logs or DevTools.
-        trail: list[str] = [f"Titles: {search_titles}"]
+        trail: list[str] = [f"Search titles used: {search_titles}"]
         jobs_store.update_job(job_id, message=" → ".join(trail))
         logger.info("search_titles=%s skill_signals=%s", search_titles, skill_signals)
 
@@ -206,6 +280,9 @@ async def _run_analysis(
         # Dict keyed by job_url prevents re-scoring the same job across windows
         all_scored: dict[str, dict] = {}
         timed_out = False
+        used_seen_fallback = False
+        used_prefilter_bypass = False
+        used_score_fallback = False
 
         # Include accumulated trail in live scrape-progress messages so the
         # per-title "Scraping: X" updates show context too.
@@ -230,15 +307,21 @@ async def _run_analysis(
                         timeout=config.SCRAPE_TIMEOUT_SECONDS,
                     )
 
-                trail.append(f"Scraped {len(df)} ({window}h)")
+                raw_df = df
+                trail.append(f"{window}h raw jobs scraped: {len(raw_df)}")
                 jobs_store.update_job(job_id, message=" → ".join(trail))
                 logger.info(trail[-1])
-                if df.empty:
+                if raw_df.empty:
                     continue
 
                 # Step 3: Dedup — drop jobs already returned in previous runs.
-                df = await asyncio.to_thread(dedup.filter_unseen, df)
-                trail.append(f"After dedup: {len(df)}")
+                df = await asyncio.to_thread(dedup.filter_unseen, raw_df)
+                if df.empty and not raw_df.empty:
+                    df = raw_df
+                    used_seen_fallback = True
+                    trail.append(f"{window}h after dedup: 0; retrying with seen jobs")
+                else:
+                    trail.append(f"{window}h after dedup: {len(df)}")
                 jobs_store.update_job(job_id, message=" → ".join(trail))
                 logger.info(trail[-1])
 
@@ -251,7 +334,14 @@ async def _run_analysis(
 
                 # Step 4: Prefilter — fast token-overlap stage
                 filtered = await asyncio.to_thread(scoring.prefilter, df, resume_tokens)
-                trail.append(f"After prefilter: {len(filtered)}")
+                if filtered.empty and not df.empty:
+                    filtered = _recent_shortlist(df, config.PREFILTER_BYPASS_LIMIT)
+                    used_prefilter_bypass = True
+                    trail.append(
+                        f"{window}h after keyword prefilter: 0; scoring recent shortlist: {len(filtered)}"
+                    )
+                else:
+                    trail.append(f"{window}h after keyword prefilter: {len(filtered)}")
                 jobs_store.update_job(job_id, message=" → ".join(trail))
                 logger.info(trail[-1])
 
@@ -262,13 +352,36 @@ async def _run_analysis(
                 jobs_store.update_job(
                     job_id, message=" → ".join(trail) + " → Scoring with AI…"
                 )
-                scored = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        scoring.score_with_claude, filtered, resume_text, skill_signals, total_yoe, ai_client
-                    ),
-                    timeout=config.SCRAPE_TIMEOUT_SECONDS,
+                try:
+                    scored = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            scoring.score_with_claude,
+                            filtered,
+                            resume_text,
+                            skill_signals,
+                            total_yoe,
+                            ai_client,
+                            resume_tokens,
+                            window,
+                        ),
+                        timeout=config.SCRAPE_TIMEOUT_SECONDS,
+                    )
+                except Exception as e:
+                    logger.warning("score_with_claude failed, using fallback scores: %s", e)
+                    scored = await asyncio.to_thread(
+                        scoring.fallback_score_dataframe, filtered, resume_tokens, window
+                    )
+
+                fallback_count = (
+                    int(scored["used_fallback_score"].fillna(False).sum())
+                    if "used_fallback_score" in scored.columns
+                    else 0
                 )
-                trail.append(f"Scored: {len(scored)}")
+                if fallback_count:
+                    used_score_fallback = True
+                trail.append(f"{window}h jobs scored by Claude: {len(scored)}")
+                if fallback_count:
+                    trail.append(f"{window}h fallback scores used: {fallback_count}")
                 jobs_store.update_job(job_id, message=" → ".join(trail))
                 logger.info(trail[-1])
 
@@ -282,7 +395,7 @@ async def _run_analysis(
                 timed_out = True
                 break
 
-        trail.append(f"Final: {len(all_scored)}")
+        trail.append(f"Final scored candidates accumulated: {len(all_scored)}")
         jobs_store.update_job(job_id, message=" → ".join(trail))
         logger.info(trail[-1])
 
@@ -296,9 +409,10 @@ async def _run_analysis(
             return
 
         # Step 6: Assemble final top-N across all windows, re-rank
-        rows = sorted(all_scored.values(), key=lambda r: r.get("ats_score", 0), reverse=True)
-        final = pd.DataFrame(rows[:top_results]).reset_index(drop=True)
+        final = scoring.sort_scored(pd.DataFrame(all_scored.values())).head(top_results).reset_index(drop=True)
         final.insert(0, "rank", range(1, len(final) + 1))
+        trail.append(f"Final jobs returned: {len(final)}")
+        jobs_store.update_job(job_id, message=" â†’ ".join(trail))
 
         # Step 7: Mark only the returned jobs as seen
         await asyncio.to_thread(dedup.mark_seen, final)
@@ -309,6 +423,18 @@ async def _run_analysis(
             if timed_out
             else f"Found {n} matching job{'' if n == 1 else 's'}"
         )
+        notes = []
+        if timed_out:
+            notes.append("search cut short; a job board was slow")
+        if used_seen_fallback:
+            notes.append("No brand-new jobs found, showing best recent matches including previously seen jobs.")
+        if used_prefilter_bypass:
+            notes.append("keyword prefilter was relaxed")
+        if used_score_fallback:
+            notes.append("fallback scoring used for some jobs")
+        done_msg = f"Found {n} matching job{'' if n == 1 else 's'}"
+        if notes:
+            done_msg += " (" + "; ".join(notes) + ")"
         jobs_store.set_results(job_id, final, message=done_msg)
 
     except Exception as e:
