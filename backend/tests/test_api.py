@@ -5,7 +5,7 @@ Run with: pytest tests/test_api.py -v
 import asyncio
 import json
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
@@ -88,15 +88,37 @@ def _fake_score_with_claude(df, resume_text, skill_signals, total_yoe, client, *
     return df.sort_values("ats_score", ascending=False).reset_index(drop=True)
 
 
+def _install_cache_fakes(monkeypatch, get_recent_jobs=None, count_jobs=3, stale=False):
+    if get_recent_jobs is None:
+        get_recent_jobs = lambda hours_old: _fake_scrape_all(
+            "United States", False, hours_old, search_terms=main.config.DEFAULT_STEM_SEARCH_TITLES
+        )
+    monkeypatch.setattr(main.job_cache, "count_jobs", lambda: count_jobs)
+    monkeypatch.setattr(main.job_cache, "get_cache_age_minutes", lambda: 5)
+    monkeypatch.setattr(main.job_cache, "is_cache_stale", lambda max_age_minutes=60: stale)
+    monkeypatch.setattr(main.job_cache, "refresh_job_cache", lambda *args, **kwargs: {
+        "status": "done",
+        "raw_count": count_jobs,
+        "inserted_count": count_jobs,
+        "updated_count": 0,
+        "message": "ok",
+    })
+    monkeypatch.setattr(main.job_cache, "get_recent_jobs", get_recent_jobs)
+    monkeypatch.setattr(
+        main.dedup,
+        "split_seen",
+        lambda df, resume_hash: (df.reset_index(drop=True), df.iloc[0:0].copy()),
+    )
+    monkeypatch.setattr(main.dedup, "mark_seen", lambda df, resume_hash=None: None)
+
+
 # ---------------------------------------------------------------------------
 # Base fixture used by existing tests
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def client(monkeypatch):
-    monkeypatch.setattr(main.scraper, "scrape_all", _fake_scrape_all)
-    monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
-    monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+    _install_cache_fakes(monkeypatch)
     monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
     monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
     monkeypatch.setattr(main.resume_parser, "extract_keywords",
@@ -165,9 +187,7 @@ def test_results_sorted_by_ats_score(monkeypatch):
         return df.sort_values("ats_score", ascending=False).reset_index(drop=True)
 
     with TestClient(main.app) as c:
-        monkeypatch.setattr(main.scraper, "scrape_all", _fake_scrape_all)
-        monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
-        monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+        _install_cache_fakes(monkeypatch)
         monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
         monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
         monkeypatch.setattr(main.resume_parser, "extract_keywords",
@@ -226,9 +246,7 @@ def test_resume_reuse(monkeypatch):
             }
         return None
 
-    monkeypatch.setattr(main.scraper, "scrape_all", _fake_scrape_all)
-    monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
-    monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+    _install_cache_fakes(monkeypatch)
     monkeypatch.setattr(main.resume_store, "load_resume", fake_load_resume)
     monkeypatch.setattr(main.resume_store, "save_resume", fake_save_resume)
     monkeypatch.setattr(main.resume_parser, "extract_keywords", fake_extract_keywords)
@@ -270,18 +288,13 @@ def test_resume_reuse(monkeypatch):
 def test_timeout_mid_loop_returns_partial_results(monkeypatch):
     """If the 72h fallback window times out, the job should still complete with
     whatever results were scored in the first (24h) window."""
-    call_count = 0
+    windows = []
 
-    def scrape_first_ok_then_timeout(location, is_remote, hours_old, on_progress=None, search_terms=None):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return _fake_scrape_all(location, is_remote, hours_old, on_progress, search_terms)
-        raise asyncio.TimeoutError()
+    def cached_by_window(hours_old):
+        windows.append(hours_old)
+        return _fake_scrape_all("United States", False, hours_old)
 
-    monkeypatch.setattr(main.scraper, "scrape_all", scrape_first_ok_then_timeout)
-    monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
-    monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+    _install_cache_fakes(monkeypatch, get_recent_jobs=cached_by_window)
     monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
     monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
     monkeypatch.setattr(main.resume_parser, "extract_keywords",
@@ -309,8 +322,8 @@ def test_timeout_mid_loop_returns_partial_results(monkeypatch):
     assert body["status"] == "done", f"Expected done, got: {body}"
     assert body["error"] is None
     results = body["results"]
-    assert len(results) >= 1, "Should have results from the first (non-timed-out) window"
-    assert "cut short" in body["message"], f"Message should note partial results: {body['message']}"
+    assert len(results) >= 1, "Should have results from the cached window"
+    assert windows[:3] == [24, 72, 168]
 
 
 def test_yoe_extracted_and_stored(monkeypatch):
@@ -320,9 +333,7 @@ def test_yoe_extracted_and_stored(monkeypatch):
     def fake_save_resume(**kw):
         stored.update(kw)
 
-    monkeypatch.setattr(main.scraper, "scrape_all", _fake_scrape_all)
-    monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
-    monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+    _install_cache_fakes(monkeypatch)
     monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
     monkeypatch.setattr(main.resume_store, "save_resume", fake_save_resume)
     monkeypatch.setattr(main.resume_parser, "extract_keywords",
@@ -442,7 +453,6 @@ def test_get_resume_returns_cleaned_search_titles(monkeypatch):
 
 def test_old_cached_resume_analysis_is_reextracted(monkeypatch):
     extract_calls = []
-    captured_search_terms = []
     stored_resume = {
         "filename": "resume.txt",
         "text": (
@@ -468,13 +478,7 @@ def test_old_cached_resume_analysis_is_reextracted(monkeypatch):
     def fake_save_resume(**kw):
         stored_resume.update(kw)
 
-    def fake_scrape_all(location, is_remote, hours_old, on_progress=None, search_terms=None):
-        captured_search_terms.append(list(search_terms or []))
-        return _fake_scrape_all(location, is_remote, hours_old, on_progress, search_terms)
-
-    monkeypatch.setattr(main.scraper, "scrape_all", fake_scrape_all)
-    monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
-    monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+    _install_cache_fakes(monkeypatch)
     monkeypatch.setattr(main.resume_store, "load_resume", lambda: stored_resume.copy())
     monkeypatch.setattr(main.resume_store, "save_resume", fake_save_resume)
     monkeypatch.setattr(main.resume_parser, "extract_keywords", fake_extract_keywords)
@@ -495,9 +499,9 @@ def test_old_cached_resume_analysis_is_reextracted(monkeypatch):
     assert body["status"] == "done", body
     assert len(extract_calls) == 1
     assert stored_resume["analysis_version"] == main.config.RESUME_ANALYSIS_VERSION
-    assert captured_search_terms
-    assert captured_search_terms[0][:3] == ["AI Engineer", "Machine Learning Engineer", "Data Scientist"]
-    assert "GenAI Engineer" in captured_search_terms[0]
+    assert "AI Engineer" in body["message"]
+    assert "GenAI Engineer" in body["message"]
+    assert "mcp tool" not in body["message"].lower()
 
 
 def test_default_search_titles_are_always_included():
@@ -515,15 +519,13 @@ def test_default_search_titles_are_always_included():
 def test_empty_24h_expands_to_72h_and_168h(monkeypatch):
     windows = []
 
-    def scrape_by_window(location, is_remote, hours_old, on_progress=None, search_terms=None):
+    def cached_by_window(hours_old):
         windows.append(hours_old)
         if hours_old < 168:
             return pd.DataFrame()
-        return _fake_scrape_all(location, is_remote, hours_old, on_progress, search_terms)
+        return _fake_scrape_all("United States", False, hours_old)
 
-    monkeypatch.setattr(main.scraper, "scrape_all", scrape_by_window)
-    monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
-    monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+    _install_cache_fakes(monkeypatch, get_recent_jobs=cached_by_window)
     monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
     monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
     monkeypatch.setattr(main.resume_parser, "extract_keywords", lambda text, client: _FAKE_KW)
@@ -543,43 +545,127 @@ def test_empty_24h_expands_to_72h_and_168h(monkeypatch):
     assert len(body["results"]) >= 1
 
 
-def test_scraper_never_runs_with_empty_search_titles(monkeypatch):
+def test_scraper_never_runs_with_empty_search_titles(monkeypatch, tmp_path):
     captured_terms = []
 
     def capture_terms(location, is_remote, hours_old, on_progress=None, search_terms=None):
         captured_terms.append(list(search_terms or []))
         return _fake_scrape_all(location, is_remote, hours_old, on_progress, search_terms)
 
-    monkeypatch.setattr(main.scraper, "scrape_all", capture_terms)
-    monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
-    monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+    monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
+    monkeypatch.setattr(main.job_cache.scraper, "scrape_all", capture_terms)
+    result = main.job_cache.refresh_job_cache(force=True, location="United States", is_remote=False)
+
+    assert result["status"] == "done"
+    assert captured_terms
+    assert captured_terms[0] == main.config.DEFAULT_STEM_SEARCH_TITLES
+
+
+def test_job_cache_upserts_and_reads_recent_jobs(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
+    now = datetime.now(timezone.utc).isoformat()
+    df = pd.DataFrame([
+        {
+            "title": "AI Engineer",
+            "company": "Acme",
+            "location": "Remote",
+            "site": "linkedin",
+            "description": "Python RAG",
+            "date_posted": date.today(),
+            "job_url": "http://cache/1",
+        }
+    ])
+
+    counts = main.job_cache.upsert_jobs(df, scraped_at=now)
+    assert counts == {"raw_count": 1, "inserted_count": 1, "updated_count": 0}
+
+    df2 = pd.concat([
+        df.assign(title="Senior AI Engineer"),
+        pd.DataFrame([{
+            "title": "Data Scientist",
+            "company": "DataCo",
+            "location": "NYC",
+            "site": "indeed",
+            "description": "SQL ML",
+            "date_posted": date.today(),
+            "job_url": "http://cache/2",
+        }]),
+    ], ignore_index=True)
+    counts = main.job_cache.upsert_jobs(df2, scraped_at=now)
+
+    recent = main.job_cache.get_recent_jobs(24)
+    assert counts == {"raw_count": 2, "inserted_count": 1, "updated_count": 1}
+    assert len(recent) == 2
+    assert "Senior AI Engineer" in set(recent["title"])
+
+
+def test_stale_cache_refreshes_with_broad_stem_titles(monkeypatch, tmp_path):
+    captured_terms = []
+
+    def capture_scrape(location, is_remote, hours_old, on_progress=None, search_terms=None):
+        captured_terms.append(list(search_terms or []))
+        return _fake_scrape_all(location, is_remote, hours_old, on_progress, search_terms)
+
+    monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
+    monkeypatch.setattr(main.job_cache.scraper, "scrape_all", capture_scrape)
+
+    assert main.job_cache.is_cache_stale()
+    result = main.job_cache.refresh_job_cache(force=False, location="United States", is_remote=False)
+
+    assert result["status"] == "done"
+    assert result["raw_count"] == 3
+    assert main.job_cache.count_jobs() == 3
+    assert main.job_cache.get_cache_age_minutes() is not None
+    assert captured_terms == [main.config.DEFAULT_STEM_SEARCH_TITLES]
+
+
+def test_user_run_uses_cached_jobs_instead_of_live_scraper(monkeypatch):
+    def live_scraper_should_not_run(*args, **kwargs):
+        raise AssertionError("user run should not call the live scraper")
+
+    _install_cache_fakes(monkeypatch)
+    monkeypatch.setattr(main.job_cache.scraper, "scrape_all", live_scraper_should_not_run)
     monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
     monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
-    monkeypatch.setattr(main.resume_parser, "extract_keywords", lambda text, client: {
-        "search_titles": [],
-        "skill_signals": [],
-        "total_yoe": None,
-    })
+    monkeypatch.setattr(main.resume_parser, "extract_keywords", lambda text, client: _FAKE_KW)
     monkeypatch.setattr(main.scoring, "score_with_claude", _fake_score_with_claude)
 
     with TestClient(main.app) as c:
         r = c.post(
             "/api/analyze",
-            files={"resume": ("resume.txt", b"general resume text", "text/plain")},
+            files={"resume": ("resume.txt", b"Python RAG LangChain AWS MLOps", "text/plain")},
             data={"location": "United States", "is_remote": "false", "hours_old": "24"},
         )
         assert r.status_code == 200, r.text
         body = _wait_for_done(c, r.json()["job_id"])
 
     assert body["status"] == "done", body
-    assert captured_terms
-    assert captured_terms[0] == main.config.DEFAULT_SEARCH_TITLES
+    assert len(body["results"]) >= 1
+
+
+def test_seen_jobs_are_per_resume_hash(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.dedup, "_DB_PATH", str(tmp_path / "seen.db"))
+    jobs = _fake_scrape_all("United States", False, 24)
+    hash_a = main.dedup.resume_hash("resume A")
+    hash_b = main.dedup.resume_hash("resume B")
+
+    main.dedup.mark_seen(jobs.head(1), hash_a)
+    unseen_a, seen_a = main.dedup.split_seen(jobs, hash_a)
+    unseen_b, seen_b = main.dedup.split_seen(jobs, hash_b)
+
+    assert len(seen_a) == 1
+    assert len(unseen_a) == len(jobs) - 1
+    assert seen_b.empty
+    assert len(unseen_b) == len(jobs)
 
 
 def test_dedup_empty_falls_back_to_seen_jobs(monkeypatch):
-    monkeypatch.setattr(main.scraper, "scrape_all", _fake_scrape_all)
-    monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df.iloc[0:0].copy())
-    monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+    _install_cache_fakes(monkeypatch)
+    monkeypatch.setattr(
+        main.dedup,
+        "split_seen",
+        lambda df, resume_hash: (df.iloc[0:0].copy(), df.assign(seen_before=True).reset_index(drop=True)),
+    )
     monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
     monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
     monkeypatch.setattr(main.resume_parser, "extract_keywords", lambda text, client: _FAKE_KW)
@@ -600,9 +686,7 @@ def test_dedup_empty_falls_back_to_seen_jobs(monkeypatch):
 
 
 def test_prefilter_empty_bypasses_to_recent_shortlist(monkeypatch):
-    monkeypatch.setattr(main.scraper, "scrape_all", _fake_scrape_all)
-    monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
-    monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+    _install_cache_fakes(monkeypatch)
     monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
     monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
     monkeypatch.setattr(main.resume_parser, "extract_keywords", lambda text, client: _FAKE_KW)
@@ -627,9 +711,7 @@ def test_scoring_failure_returns_fallback_ranked_jobs(monkeypatch):
     def scoring_failure(*args, **kwargs):
         raise RuntimeError("Claude unavailable")
 
-    monkeypatch.setattr(main.scraper, "scrape_all", _fake_scrape_all)
-    monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
-    monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+    _install_cache_fakes(monkeypatch)
     monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
     monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
     monkeypatch.setattr(main.resume_parser, "extract_keywords", lambda text, client: _FAKE_KW)

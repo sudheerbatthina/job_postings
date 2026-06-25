@@ -8,6 +8,10 @@ DEFAULT_HOURS_OLD = 24
 FALLBACK_HOURS = [72, 168, 336]
 RESUME_ANALYSIS_VERSION = 2
 PREFILTER_BYPASS_LIMIT = 25
+JOB_CACHE_MAX_AGE_MINUTES = 60
+JOB_CACHE_REFRESH_HOURS = 168
+MIN_RAW_JOBS_FOR_RESULTS = 20
+SEEN_TTL_HOURS = 24
 
 DEFAULT_SEARCH_TITLES = [
     "AI Engineer",
@@ -19,6 +23,23 @@ DEFAULT_SEARCH_TITLES = [
     "Data Scientist",
     "ML Engineer",
     "ML Platform Engineer",
+]
+
+DEFAULT_STEM_SEARCH_TITLES = [
+    "AI Engineer",
+    "Machine Learning Engineer",
+    "ML Engineer",
+    "GenAI Engineer",
+    "LLM Engineer",
+    "Applied AI Engineer",
+    "Applied Scientist",
+    "Data Scientist",
+    "Data Engineer",
+    "Analytics Engineer",
+    "Software Engineer",
+    "Backend Engineer",
+    "Platform Engineer",
+    "MLOps Engineer",
 ]
 
 DEFAULT_SKILL_SIGNALS = [

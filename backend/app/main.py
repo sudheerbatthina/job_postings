@@ -26,7 +26,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from . import config, jobs_store, resume_parser, resume_store, scraper, scoring, export, dedup
+from . import config, jobs_store, resume_parser, resume_store, scoring, export, dedup, job_cache
 
 # ---------------------------------------------------------------------------
 # App + rate limiter
@@ -191,6 +191,179 @@ def _recent_shortlist(df: pd.DataFrame, limit: int) -> pd.DataFrame:
     return df.sort_values("date_posted", ascending=False, na_position="last").head(limit).reset_index(drop=True)
 
 
+def _update_trail(job_id: str, trail: list[str]) -> None:
+    jobs_store.update_job(job_id, message=" → ".join(trail))
+
+
+async def _run_cached_search(
+    job_id: str,
+    resume_text: str,
+    resume_tokens: set[str],
+    skill_signals: list[str],
+    total_yoe: int | None,
+    location: str,
+    is_remote: bool,
+    hours_old: int,
+    top_results: int,
+    trail: list[str],
+) -> None:
+    windows = [hours_old] + [h for h in config.FALLBACK_HOURS if h > hours_old]
+    resume_hash_value = dedup.resume_hash(resume_text)
+    used_seen_fallback = False
+    used_prefilter_bypass = False
+    used_score_fallback = False
+    cache_refreshed = False
+
+    cache_age = await asyncio.to_thread(job_cache.get_cache_age_minutes)
+    cache_count = await asyncio.to_thread(job_cache.count_jobs)
+    age_label = "unknown" if cache_age is None else f"{cache_age:.1f}m"
+    trail.append(f"Job cache age: {age_label}; cached jobs: {cache_count}")
+    _update_trail(job_id, trail)
+
+    cache_stale = await asyncio.to_thread(
+        job_cache.is_cache_stale, config.JOB_CACHE_MAX_AGE_MINUTES
+    )
+    if cache_count == 0 or cache_stale:
+        cache_refreshed = True
+        trail.append("Refreshing job cache...")
+        _update_trail(job_id, trail)
+        refresh = await asyncio.to_thread(
+            job_cache.refresh_job_cache,
+            True,
+            location,
+            is_remote,
+            config.JOB_CACHE_REFRESH_HOURS,
+        )
+        trail.append(
+            f"Cache refresh {refresh.get('status')}: raw {refresh.get('raw_count', 0)}, "
+            f"inserted {refresh.get('inserted_count', 0)}, updated {refresh.get('updated_count', 0)}"
+        )
+        _update_trail(job_id, trail)
+
+    raw_df = pd.DataFrame()
+    selected_window = windows[-1]
+    for window in windows:
+        candidate_df = await asyncio.to_thread(job_cache.get_recent_jobs, window)
+        trail.append(f"{window}h cached jobs selected: {len(candidate_df)}")
+        _update_trail(job_id, trail)
+        raw_df = candidate_df
+        selected_window = window
+        if len(candidate_df) >= top_results:
+            break
+
+    if raw_df.empty:
+        jobs_store.update_job(
+            job_id,
+            status="done",
+            message="No matching jobs found because the job cache is empty",
+            results=[],
+        )
+        return
+
+    unseen_df, seen_df = await asyncio.to_thread(dedup.split_seen, raw_df, resume_hash_value)
+    if not unseen_df.empty:
+        unseen_df = unseen_df.copy()
+        unseen_df["seen_before"] = False
+    trail.append(f"Unseen cached jobs: {len(unseen_df)}")
+
+    if len(unseen_df) < top_results and not seen_df.empty:
+        needed = top_results - len(unseen_df)
+        candidate_df = pd.concat([unseen_df, seen_df.head(needed)], ignore_index=True)
+        used_seen_fallback = True
+        trail.append(f"Seen-fill jobs: {min(needed, len(seen_df))}")
+    else:
+        candidate_df = unseen_df
+        trail.append("Seen-fill jobs: 0")
+    _update_trail(job_id, trail)
+
+    if candidate_df.empty:
+        candidate_df = raw_df.copy()
+        candidate_df["seen_before"] = True
+        used_seen_fallback = True
+        trail.append(f"All cached jobs were seen; scoring cached pool: {len(candidate_df)}")
+        _update_trail(job_id, trail)
+
+    filtered = await asyncio.to_thread(scoring.prefilter, candidate_df, resume_tokens)
+    if filtered.empty and not candidate_df.empty:
+        filtered = _recent_shortlist(candidate_df, config.PREFILTER_BYPASS_LIMIT)
+        used_prefilter_bypass = True
+        trail.append(f"Jobs after prefilter: 0; scoring recent cached shortlist: {len(filtered)}")
+    else:
+        trail.append(f"Jobs after prefilter: {len(filtered)}")
+    _update_trail(job_id, trail)
+
+    if filtered.empty:
+        filtered = _recent_shortlist(raw_df, config.PREFILTER_BYPASS_LIMIT)
+        used_prefilter_bypass = True
+        trail.append(f"Showing best recent matches from cached jobs: {len(filtered)}")
+        _update_trail(job_id, trail)
+
+    try:
+        scored = await asyncio.wait_for(
+            asyncio.to_thread(
+                scoring.score_with_claude,
+                filtered,
+                resume_text,
+                skill_signals,
+                total_yoe,
+                ai_client,
+                resume_tokens,
+                selected_window,
+            ),
+            timeout=config.SCRAPE_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        logger.warning("score_with_claude failed, using fallback scores: %s", e)
+        scored = await asyncio.to_thread(
+            scoring.fallback_score_dataframe, filtered, resume_tokens, selected_window
+        )
+
+    fallback_count = (
+        int(scored["used_fallback_score"].fillna(False).sum())
+        if "used_fallback_score" in scored.columns
+        else 0
+    )
+    if fallback_count:
+        used_score_fallback = True
+    trail.append(f"Jobs scored: {len(scored)}")
+    if fallback_count:
+        trail.append(f"Fallback scores used: {fallback_count}")
+    _update_trail(job_id, trail)
+
+    if scored.empty:
+        jobs_store.update_job(
+            job_id,
+            status="done",
+            message="No matching jobs found because the job cache is empty",
+            results=[],
+        )
+        return
+
+    final = scoring.sort_scored(scored).head(top_results).reset_index(drop=True)
+    final.insert(0, "rank", range(1, len(final) + 1))
+    trail.append(f"Final jobs returned: {len(final)}")
+    _update_trail(job_id, trail)
+
+    await asyncio.to_thread(dedup.mark_seen, final, resume_hash_value)
+
+    notes = []
+    if cache_refreshed:
+        notes.append("job cache refreshed")
+    if used_seen_fallback:
+        notes.append("No brand-new jobs found, showing best recent matches including previously seen jobs.")
+    if used_prefilter_bypass:
+        notes.append("keyword prefilter was relaxed; showing best recent matches from cached jobs")
+    if used_score_fallback:
+        notes.append("fallback scoring used for some jobs")
+
+    n = len(final)
+    done_msg = f"Found {n} matching job{'' if n == 1 else 's'}"
+    if notes:
+        done_msg += " (" + "; ".join(notes) + ")"
+    done_msg += " | " + " → ".join(trail)
+    jobs_store.set_results(job_id, final, message=done_msg)
+
+
 async def _run_analysis(
     job_id: str,
     filename: str,
@@ -275,167 +448,19 @@ async def _run_analysis(
         jobs_store.update_job(job_id, message=" → ".join(trail))
         logger.info("search_titles=%s skill_signals=%s", search_titles, skill_signals)
 
-        # Steps 2-6: window retry loop — widen search until we have top_results
-        windows = [hours_old] + [h for h in config.FALLBACK_HOURS if h > hours_old]
-        # Dict keyed by job_url prevents re-scoring the same job across windows
-        all_scored: dict[str, dict] = {}
-        timed_out = False
-        used_seen_fallback = False
-        used_prefilter_bypass = False
-        used_score_fallback = False
-
-        # Include accumulated trail in live scrape-progress messages so the
-        # per-title "Scraping: X" updates show context too.
-        def progress(msg: str) -> None:
-            jobs_store.update_job(job_id, message=" → ".join(trail) + " → " + msg)
-
-        for window in windows:
-            if len(all_scored) >= top_results:
-                break
-
-            try:
-                # Step 2: Scrape — timeout inside the semaphore so a hang still releases it
-                async with jobs_store.SCRAPE_SEMAPHORE:
-                    jobs_store.update_job(
-                        job_id, message=" → ".join(trail) + f" → Searching {window}h window…"
-                    )
-                    df = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            scraper.scrape_all, location, is_remote, window, progress,
-                            search_terms=search_titles,
-                        ),
-                        timeout=config.SCRAPE_TIMEOUT_SECONDS,
-                    )
-
-                raw_df = df
-                trail.append(f"{window}h raw jobs scraped: {len(raw_df)}")
-                jobs_store.update_job(job_id, message=" → ".join(trail))
-                logger.info(trail[-1])
-                if raw_df.empty:
-                    continue
-
-                # Step 3: Dedup — drop jobs already returned in previous runs.
-                df = await asyncio.to_thread(dedup.filter_unseen, raw_df)
-                if df.empty and not raw_df.empty:
-                    df = raw_df
-                    used_seen_fallback = True
-                    trail.append(f"{window}h after dedup: 0; retrying with seen jobs")
-                else:
-                    trail.append(f"{window}h after dedup: {len(df)}")
-                jobs_store.update_job(job_id, message=" → ".join(trail))
-                logger.info(trail[-1])
-
-                # Drop URLs already accumulated in earlier windows of this run
-                if all_scored and "job_url" in df.columns:
-                    df = df[~df["job_url"].isin(all_scored.keys())].reset_index(drop=True)
-
-                if df.empty:
-                    continue
-
-                # Step 4: Prefilter — fast token-overlap stage
-                filtered = await asyncio.to_thread(scoring.prefilter, df, resume_tokens)
-                if filtered.empty and not df.empty:
-                    filtered = _recent_shortlist(df, config.PREFILTER_BYPASS_LIMIT)
-                    used_prefilter_bypass = True
-                    trail.append(
-                        f"{window}h after keyword prefilter: 0; scoring recent shortlist: {len(filtered)}"
-                    )
-                else:
-                    trail.append(f"{window}h after keyword prefilter: {len(filtered)}")
-                jobs_store.update_job(job_id, message=" → ".join(trail))
-                logger.info(trail[-1])
-
-                if filtered.empty:
-                    continue
-
-                # Step 5: Claude scoring — returns all rows sorted by score, no threshold
-                jobs_store.update_job(
-                    job_id, message=" → ".join(trail) + " → Scoring with AI…"
-                )
-                try:
-                    scored = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            scoring.score_with_claude,
-                            filtered,
-                            resume_text,
-                            skill_signals,
-                            total_yoe,
-                            ai_client,
-                            resume_tokens,
-                            window,
-                        ),
-                        timeout=config.SCRAPE_TIMEOUT_SECONDS,
-                    )
-                except Exception as e:
-                    logger.warning("score_with_claude failed, using fallback scores: %s", e)
-                    scored = await asyncio.to_thread(
-                        scoring.fallback_score_dataframe, filtered, resume_tokens, window
-                    )
-
-                fallback_count = (
-                    int(scored["used_fallback_score"].fillna(False).sum())
-                    if "used_fallback_score" in scored.columns
-                    else 0
-                )
-                if fallback_count:
-                    used_score_fallback = True
-                trail.append(f"{window}h jobs scored by Claude: {len(scored)}")
-                if fallback_count:
-                    trail.append(f"{window}h fallback scores used: {fallback_count}")
-                jobs_store.update_job(job_id, message=" → ".join(trail))
-                logger.info(trail[-1])
-
-                for _, row in scored.iterrows():
-                    url = row.get("job_url")
-                    if url and url not in all_scored:
-                        all_scored[url] = row.to_dict()
-
-            except asyncio.TimeoutError:
-                trail.append(f"Timeout on {window}h window")
-                timed_out = True
-                break
-
-        trail.append(f"Final scored candidates accumulated: {len(all_scored)}")
-        jobs_store.update_job(job_id, message=" → ".join(trail))
-        logger.info(trail[-1])
-
-        if not all_scored:
-            msg = (
-                "Job boards were too slow to respond — try again in a few minutes"
-                if timed_out
-                else "No matching jobs found — try checking back later"
-            )
-            jobs_store.update_job(job_id, status="done", message=msg, results=[])
-            return
-
-        # Step 6: Assemble final top-N across all windows, re-rank
-        final = scoring.sort_scored(pd.DataFrame(all_scored.values())).head(top_results).reset_index(drop=True)
-        final.insert(0, "rank", range(1, len(final) + 1))
-        trail.append(f"Final jobs returned: {len(final)}")
-        jobs_store.update_job(job_id, message=" → ".join(trail))
-
-        # Step 7: Mark only the returned jobs as seen
-        await asyncio.to_thread(dedup.mark_seen, final)
-
-        n = len(final)
-        done_msg = (
-            f"Found {n} job{'' if n == 1 else 's'} (search cut short — a job board was slow)"
-            if timed_out
-            else f"Found {n} matching job{'' if n == 1 else 's'}"
+        await _run_cached_search(
+            job_id=job_id,
+            resume_text=resume_text,
+            resume_tokens=resume_tokens,
+            skill_signals=skill_signals,
+            total_yoe=total_yoe,
+            location=location,
+            is_remote=is_remote,
+            hours_old=hours_old,
+            top_results=top_results,
+            trail=trail,
         )
-        notes = []
-        if timed_out:
-            notes.append("search cut short; a job board was slow")
-        if used_seen_fallback:
-            notes.append("No brand-new jobs found, showing best recent matches including previously seen jobs.")
-        if used_prefilter_bypass:
-            notes.append("keyword prefilter was relaxed")
-        if used_score_fallback:
-            notes.append("fallback scoring used for some jobs")
-        done_msg = f"Found {n} matching job{'' if n == 1 else 's'}"
-        if notes:
-            done_msg += " (" + "; ".join(notes) + ")"
-        jobs_store.set_results(job_id, final, message=done_msg)
+        return
 
     except Exception as e:
         jobs_store.update_job(job_id, status="error", message="Something went wrong", error=str(e))
