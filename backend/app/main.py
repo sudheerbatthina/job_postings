@@ -190,7 +190,12 @@ async def _run_analysis(
         if not search_titles:
             search_titles = ["AI Engineer", "Machine Learning Engineer"]
 
-        logger.info("[DEBUG] search_titles=%s  skill_signals=%s", search_titles, skill_signals)
+        # Accumulated stage trail — appended after each pipeline step and pushed
+        # to the job message so the full path is visible in the frontend without
+        # needing Railway logs or DevTools.
+        trail: list[str] = [f"Titles: {search_titles}"]
+        jobs_store.update_job(job_id, message=" → ".join(trail))
+        logger.info("search_titles=%s skill_signals=%s", search_titles, skill_signals)
 
         # Steps 2-6: window retry loop — widen search until we have top_results
         windows = [hours_old] + [h for h in config.FALLBACK_HOURS if h > hours_old]
@@ -198,8 +203,10 @@ async def _run_analysis(
         all_scored: dict[str, dict] = {}
         timed_out = False
 
+        # Include accumulated trail in live scrape-progress messages so the
+        # per-title "Scraping: X" updates show context too.
         def progress(msg: str) -> None:
-            jobs_store.update_job(job_id, message=msg)
+            jobs_store.update_job(job_id, message=" → ".join(trail) + " → " + msg)
 
         for window in windows:
             if len(all_scored) >= top_results:
@@ -208,7 +215,9 @@ async def _run_analysis(
             try:
                 # Step 2: Scrape — timeout inside the semaphore so a hang still releases it
                 async with jobs_store.SCRAPE_SEMAPHORE:
-                    jobs_store.update_job(job_id, message=f"Searching jobs from last {window}h…")
+                    jobs_store.update_job(
+                        job_id, message=" → ".join(trail) + f" → Searching {window}h window…"
+                    )
                     df = await asyncio.wait_for(
                         asyncio.to_thread(
                             scraper.scrape_all, location, is_remote, window, progress,
@@ -217,17 +226,20 @@ async def _run_analysis(
                         timeout=config.SCRAPE_TIMEOUT_SECONDS,
                     )
 
-                _msg = f"[DEBUG] Scraped {len(df)} raw jobs from {window}h window"
-                logger.info(_msg)
-                jobs_store.update_job(job_id, message=_msg)
+                trail.append(f"Scraped {len(df)} ({window}h)")
+                jobs_store.update_job(job_id, message=" → ".join(trail))
+                logger.info(trail[-1])
                 if df.empty:
                     continue
 
-                # Step 3: Dedup — drop jobs already returned in previous runs
-                df = await asyncio.to_thread(dedup.filter_unseen, df)
-                _msg = f"[DEBUG] {len(df)} jobs after removing already-seen"
-                logger.info(_msg)
-                jobs_store.update_job(job_id, message=_msg)
+                # Step 3: Dedup — drop jobs already returned in previous runs.
+                # DIAGNOSTIC: set DEDUP_DISABLED=true to bypass and confirm whether
+                # dedup is the stage zeroing out results. Not a permanent change.
+                if os.environ.get("DEDUP_DISABLED", "").lower() != "true":
+                    df = await asyncio.to_thread(dedup.filter_unseen, df)
+                trail.append(f"After dedup: {len(df)}")
+                jobs_store.update_job(job_id, message=" → ".join(trail))
+                logger.info(trail[-1])
 
                 # Drop URLs already accumulated in earlier windows of this run
                 if all_scored and "job_url" in df.columns:
@@ -237,26 +249,27 @@ async def _run_analysis(
                     continue
 
                 # Step 4: Prefilter — fast token-overlap stage
-                jobs_store.update_job(job_id, message="Filtering matches…")
                 filtered = await asyncio.to_thread(scoring.prefilter, df, resume_tokens)
-                _msg = f"[DEBUG] {len(filtered)} jobs survived keyword prefilter (of {len(df)} post-dedup)"
-                logger.info(_msg)
-                jobs_store.update_job(job_id, message=_msg)
+                trail.append(f"After prefilter: {len(filtered)}")
+                jobs_store.update_job(job_id, message=" → ".join(trail))
+                logger.info(trail[-1])
 
                 if filtered.empty:
                     continue
 
                 # Step 5: Claude scoring — returns all rows sorted by score, no threshold
-                jobs_store.update_job(job_id, message="Scoring with AI…")
+                jobs_store.update_job(
+                    job_id, message=" → ".join(trail) + " → Scoring with AI…"
+                )
                 scored = await asyncio.wait_for(
                     asyncio.to_thread(
                         scoring.score_with_claude, filtered, resume_text, skill_signals, ai_client
                     ),
                     timeout=config.SCRAPE_TIMEOUT_SECONDS,
                 )
-                _msg = f"[DEBUG] {len(scored)} jobs scored by Claude"
-                logger.info(_msg)
-                jobs_store.update_job(job_id, message=_msg)
+                trail.append(f"Scored: {len(scored)}")
+                jobs_store.update_job(job_id, message=" → ".join(trail))
+                logger.info(trail[-1])
 
                 for _, row in scored.iterrows():
                     url = row.get("job_url")
@@ -264,13 +277,13 @@ async def _run_analysis(
                         all_scored[url] = row.to_dict()
 
             except asyncio.TimeoutError:
-                jobs_store.update_job(job_id, message=f"Timed out on {window}h window — using results so far…")
+                trail.append(f"Timeout on {window}h window")
                 timed_out = True
                 break
 
-        _msg = f"[DEBUG] Final: {len(all_scored)} total candidates across all windows attempted"
-        logger.info(_msg)
-        jobs_store.update_job(job_id, message=_msg)
+        trail.append(f"Final: {len(all_scored)}")
+        jobs_store.update_job(job_id, message=" → ".join(trail))
+        logger.info(trail[-1])
 
         if not all_scored:
             msg = (
