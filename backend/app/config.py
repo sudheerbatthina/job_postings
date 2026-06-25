@@ -1,6 +1,6 @@
 """Shared constants for scraping + scoring."""
 
-SITES = ["linkedin", "indeed", "google", "zip_recruiter", "glassdoor"]
+SITES = ["linkedin", "indeed", "google", "glassdoor"]
 COUNTRY_INDEED = "USA"
 
 RESULTS_WANTED_PER_TERM = 25
@@ -13,11 +13,52 @@ DEFAULT_SEARCH_TITLES = [
     "AI Engineer",
     "Machine Learning Engineer",
     "GenAI Engineer",
-    "Applied AI Engineer",
     "LLM Engineer",
-    "Data Scientist",
+    "Applied AI Engineer",
     "Applied Scientist",
+    "Data Scientist",
+    "ML Engineer",
     "ML Platform Engineer",
+]
+
+DEFAULT_SKILL_SIGNALS = [
+    "Python",
+    "SQL",
+    "Machine Learning",
+    "LLM",
+    "RAG",
+    "Snowflake",
+    "dbt",
+]
+
+RESUME_SKILL_KEYWORDS = [
+    "Python",
+    "SQL",
+    "Machine Learning",
+    "Deep Learning",
+    "LLM",
+    "RAG",
+    "LangChain",
+    "LangGraph",
+    "OpenAI",
+    "Anthropic",
+    "MCP",
+    "semantic search",
+    "semantic reranking",
+    "vector database",
+    "vector databases",
+    "embeddings",
+    "Snowflake",
+    "dbt",
+    "Airflow",
+    "Spark",
+    "AWS",
+    "GCP",
+    "Azure",
+    "Docker",
+    "Kubernetes",
+    "PyTorch",
+    "TensorFlow",
 ]
 
 WEIGHTS = {"keyword": 0.45, "resume": 0.25, "recency": 0.30}

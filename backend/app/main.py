@@ -247,7 +247,7 @@ async def _run_analysis(
             kw_dict = resume_parser.normalize_resume_analysis(kw_dict)
             search_titles = kw_dict.get("search_titles", [])
             skill_signals = kw_dict.get("skill_signals", [])
-            total_yoe = int(kw_dict.get("total_yoe") or 0)
+            total_yoe = kw_dict.get("total_yoe")
             resume_store.save_resume(
                 filename=filename,
                 text=resume_text,
@@ -412,7 +412,7 @@ async def _run_analysis(
         final = scoring.sort_scored(pd.DataFrame(all_scored.values())).head(top_results).reset_index(drop=True)
         final.insert(0, "rank", range(1, len(final) + 1))
         trail.append(f"Final jobs returned: {len(final)}")
-        jobs_store.update_job(job_id, message=" â†’ ".join(trail))
+        jobs_store.update_job(job_id, message=" → ".join(trail))
 
         # Step 7: Mark only the returned jobs as seen
         await asyncio.to_thread(dedup.mark_seen, final)

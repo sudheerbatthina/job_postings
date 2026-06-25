@@ -49,6 +49,25 @@ def _fake_scrape_all(location, is_remote, hours_old, on_progress=None, search_te
 _FAKE_KW = {"search_titles": ["AI Engineer", "ML Engineer"], "skill_signals": ["RAG", "LangChain"], "total_yoe": 5}
 
 
+class _TextBlock:
+    def __init__(self, text):
+        self.text = text
+
+
+class _ClaudeMessage:
+    def __init__(self, text):
+        self.content = [_TextBlock(text)]
+
+
+class _ClaudeClient:
+    def __init__(self, text):
+        self._text = text
+        self.messages = self
+
+    def create(self, **kwargs):
+        return _ClaudeMessage(self._text)
+
+
 def _wait_for_done(client: TestClient, job_id: str, attempts: int = 50) -> dict:
     body = None
     for _ in range(attempts):
@@ -354,6 +373,42 @@ def test_search_title_sanitizer_preserves_role_titles():
     assert resume_parser.sanitize_search_titles(titles) == titles
 
 
+def test_extract_keywords_empty_claude_response_uses_safe_fallback():
+    analysis = resume_parser.extract_keywords(
+        "Python SQL Snowflake dbt RAG. 8 years of experience building ML systems.",
+        _ClaudeClient(""),
+    )
+
+    for title in main.config.DEFAULT_SEARCH_TITLES:
+        assert title in analysis["search_titles"]
+    assert "Python" in analysis["skill_signals"]
+    assert "SQL" in analysis["skill_signals"]
+    assert analysis["total_yoe"] == 8
+
+
+def test_extract_keywords_markdown_json_parses_correctly():
+    raw = """```json
+{"search_titles": ["Research Scientist", "mcp tool"], "skill_signals": ["LangGraph", "RAG"], "total_yoe": 9}
+```"""
+    analysis = resume_parser.extract_keywords("resume text", _ClaudeClient(raw))
+
+    assert "Research Scientist" in analysis["search_titles"]
+    assert "mcp tool" not in [title.lower() for title in analysis["search_titles"]]
+    assert "LangGraph" in analysis["skill_signals"]
+    assert analysis["total_yoe"] == 9
+
+
+def test_extract_keywords_malformed_json_uses_safe_fallback():
+    analysis = resume_parser.extract_keywords(
+        "No obvious keywords here.",
+        _ClaudeClient("Here is JSON: {not valid"),
+    )
+
+    assert analysis["search_titles"] == main.config.DEFAULT_SEARCH_TITLES
+    assert analysis["skill_signals"] == main.config.DEFAULT_SKILL_SIGNALS
+    assert analysis["total_yoe"] is None
+
+
 def test_unusable_search_titles_fall_back_to_default_roles():
     analysis = resume_parser.normalize_resume_analysis({
         "search_titles": ["mcp tool", "semantic reranking"],
@@ -488,6 +543,39 @@ def test_empty_24h_expands_to_72h_and_168h(monkeypatch):
     assert len(body["results"]) >= 1
 
 
+def test_scraper_never_runs_with_empty_search_titles(monkeypatch):
+    captured_terms = []
+
+    def capture_terms(location, is_remote, hours_old, on_progress=None, search_terms=None):
+        captured_terms.append(list(search_terms or []))
+        return _fake_scrape_all(location, is_remote, hours_old, on_progress, search_terms)
+
+    monkeypatch.setattr(main.scraper, "scrape_all", capture_terms)
+    monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df)
+    monkeypatch.setattr(main.dedup, "mark_seen", lambda df: None)
+    monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
+    monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
+    monkeypatch.setattr(main.resume_parser, "extract_keywords", lambda text, client: {
+        "search_titles": [],
+        "skill_signals": [],
+        "total_yoe": None,
+    })
+    monkeypatch.setattr(main.scoring, "score_with_claude", _fake_score_with_claude)
+
+    with TestClient(main.app) as c:
+        r = c.post(
+            "/api/analyze",
+            files={"resume": ("resume.txt", b"general resume text", "text/plain")},
+            data={"location": "United States", "is_remote": "false", "hours_old": "24"},
+        )
+        assert r.status_code == 200, r.text
+        body = _wait_for_done(c, r.json()["job_id"])
+
+    assert body["status"] == "done", body
+    assert captured_terms
+    assert captured_terms[0] == main.config.DEFAULT_SEARCH_TITLES
+
+
 def test_dedup_empty_falls_back_to_seen_jobs(monkeypatch):
     monkeypatch.setattr(main.scraper, "scrape_all", _fake_scrape_all)
     monkeypatch.setattr(main.dedup, "filter_unseen", lambda df: df.iloc[0:0].copy())
@@ -579,6 +667,9 @@ def test_glassdoor_location_filtering(monkeypatch):
     assert all("glassdoor" not in sites for sites in captured_site_lists), (
         f"Glassdoor should be excluded for broad location, got site lists: {captured_site_lists}"
     )
+    assert all("zip_recruiter" not in sites for sites in captured_site_lists), (
+        f"ZipRecruiter should be disabled by default, got site lists: {captured_site_lists}"
+    )
 
     captured_site_lists.clear()
 
@@ -587,4 +678,7 @@ def test_glassdoor_location_filtering(monkeypatch):
     assert captured_site_lists, "Expected at least one scrape_jobs call"
     assert all("glassdoor" in sites for sites in captured_site_lists), (
         f"Glassdoor should be included for specific location, got site lists: {captured_site_lists}"
+    )
+    assert all("zip_recruiter" not in sites for sites in captured_site_lists), (
+        f"ZipRecruiter should be disabled by default, got site lists: {captured_site_lists}"
     )

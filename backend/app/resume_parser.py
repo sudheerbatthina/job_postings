@@ -23,7 +23,7 @@ _ROLE_WORDS = {
 
 _SEARCH_TITLE_ALIASES = {
     "ai engineer": "AI Engineer",
-    "ml engineer": "Machine Learning Engineer",
+    "ml engineer": "ML Engineer",
     "machine learning engineer": "Machine Learning Engineer",
     "genai engineer": "GenAI Engineer",
     "generative ai engineer": "GenAI Engineer",
@@ -66,6 +66,65 @@ def _safe_int(value) -> int:
         return 0
 
 
+def _optional_int(value) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _message_text(message) -> str:
+    parts: list[str] = []
+    for block in getattr(message, "content", []) or []:
+        if isinstance(block, dict):
+            text = block.get("text")
+        else:
+            text = getattr(block, "text", None)
+        if text:
+            parts.append(str(text))
+    return "\n".join(parts).strip()
+
+
+def _first_json_object(raw_text: str) -> dict | None:
+    text = (raw_text or "").strip()
+    if not text:
+        return None
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            data, _ = decoder.raw_decode(text[i:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _log_parse_failure(reason: str, raw_text: str, message=None) -> None:
+    content = getattr(message, "content", None)
+    block_count = len(content) if isinstance(content, list) else None
+    logger.warning(
+        "extract_keywords parse failed: reason=%s response_len=%s content_blocks=%s",
+        reason,
+        len(raw_text or ""),
+        block_count,
+    )
+
+
+def parse_resume_analysis_response(raw_text: str, message=None) -> dict | None:
+    data = _first_json_object(raw_text)
+    if data is None:
+        _log_parse_failure("no_valid_json_object", raw_text, message)
+        return None
+    if not any(key in data for key in ("search_titles", "skill_signals", "total_yoe")):
+        _log_parse_failure("missing_expected_fields", raw_text, message)
+        return None
+    return data
+
+
 def is_valid_search_title(title: str) -> bool:
     """Return True only for role names suitable for job-board search boxes."""
     normalized = re.sub(r"\s+", " ", (title or "").strip()).lower()
@@ -102,7 +161,7 @@ def normalize_resume_analysis(data: dict | None) -> dict:
     return {
         "search_titles": search_titles,
         "skill_signals": _dedupe(_as_string_list(data.get("skill_signals"))),
-        "total_yoe": _safe_int(data.get("total_yoe")),
+        "total_yoe": _optional_int(data.get("total_yoe")),
     }
 
 
@@ -137,17 +196,34 @@ def parse_resume(filename: str, content: bytes) -> dict:
     }
 
 
-def _bigram_fallback(text: str) -> dict:
-    words = [w for w in re.findall(r"[a-zA-Z]{3,}", text.lower()) if w not in config.STOPWORDS]
-    counts: dict[str, int] = {}
-    for i in range(len(words) - 1):
-        bg = f"{words[i]} {words[i + 1]}"
-        counts[bg] = counts.get(bg, 0) + 1
-    skill_signals = [bg for bg, _ in sorted(counts.items(), key=lambda x: -x[1])[:10]]
+def _estimate_total_yoe(text: str) -> int | None:
+    patterns = [
+        r"(\d{1,2})\+?\s*(?:years|yrs)\s+(?:of\s+)?(?:professional\s+)?experience",
+        r"(?:experience|experienced).{0,40}?(\d{1,2})\+?\s*(?:years|yrs)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text or "", flags=re.IGNORECASE)
+        if match:
+            years = _optional_int(match.group(1))
+            if years is not None and years <= 60:
+                return years
+    return None
+
+
+def _fallback_skill_signals(text: str) -> list[str]:
+    lowered = (text or "").lower()
+    found = [
+        skill for skill in config.RESUME_SKILL_KEYWORDS
+        if re.search(rf"\b{re.escape(skill.lower())}\b", lowered)
+    ]
+    return _dedupe(found) or config.DEFAULT_SKILL_SIGNALS.copy()
+
+
+def fallback_resume_analysis(text: str) -> dict:
     return {
         "search_titles": config.DEFAULT_SEARCH_TITLES.copy(),
-        "skill_signals": skill_signals,
-        "total_yoe": 0,
+        "skill_signals": _fallback_skill_signals(text),
+        "total_yoe": _estimate_total_yoe(text),
     }
 
 
@@ -163,32 +239,24 @@ def extract_keywords(text: str, client: "_anthropic.Anthropic | None") -> dict:
                 messages=[{
                     "role": "user",
                     "content": (
-                        "Return ONLY valid JSON with exactly these fields: "
-                        "search_titles, skill_signals, total_yoe.\n"
-                        "search_titles must be generic job titles to search job boards with. "
-                        "Never put tools, libraries, frameworks, vendors, concepts, or skill "
-                        "phrases in search_titles. Bad search_titles include 'MCP tool', "
-                        "'LangGraph OpenAI', 'OpenAI agents', 'agents SDK', and "
-                        "'semantic reranking'.\n"
-                        "skill_signals must contain technical skills/tools/concepts used only "
-                        "for scoring relevance, such as LangGraph, OpenAI, RAG, semantic "
-                        "search, vector databases, Python, Snowflake, or dbt.\n"
-                        "total_yoe must be an integer estimate of total professional years of "
-                        "experience, or 0 if unclear.\n\n"
-                        "From this resume, return JSON with three fields:\n"
-                        "search_titles: 4-6 generic, job-board-searchable role titles this person is "
-                        "qualified for (e.g. 'AI Engineer', 'Senior Machine Learning Engineer') — these "
-                        "get typed into a job board search box, so they must look like real job titles, "
-                        "not skill names.\n"
-                        "skill_signals: 6-10 specific technical phrases that differentiate this candidate "
-                        "(e.g. 'RAG', 'LangGraph', 'agentic AI', 'MCP') — used for scoring fit, not for searching.\n"
-                        "total_yoe: integer total years of professional work experience (0 if unclear).\n"
-                        'Return only valid JSON: {"search_titles": [...], "skill_signals": [...], "total_yoe": <int>}\n\n'
+                        "Return JSON only. Do not wrap it in markdown. Do not include commentary.\n"
+                        'Use exactly this shape: {"search_titles": [], "skill_signals": [], "total_yoe": null}\n'
+                        "search_titles must be real job titles to search job boards with. "
+                        "Never put tools, libraries, frameworks, vendors, concepts, or skill phrases "
+                        "in search_titles. Bad search_titles include MCP tool, semantic reranking, "
+                        "LangGraph OpenAI, OpenAI agents, and agents SDK.\n"
+                        "skill_signals must be tools, skills, platforms, or technical concepts only. "
+                        "total_yoe must be an integer estimate of professional years of experience, "
+                        "or null if unclear.\n\n"
+                        "Resume:\n"
                         + text[:3000]
                     ),
                 }],
             )
-            return normalize_resume_analysis(json.loads(msg.content[0].text))
+            raw_text = _message_text(msg)
+            data = parse_resume_analysis_response(raw_text, msg)
+            if data is not None:
+                return normalize_resume_analysis(data)
         except Exception as e:
             logger.warning("extract_keywords failed: %s", e)
-    return normalize_resume_analysis(_bigram_fallback(text))
+    return normalize_resume_analysis(fallback_resume_analysis(text))
