@@ -497,7 +497,7 @@ def claude_score(
     try:
         msg = client.messages.create(
             model="claude-haiku-4-5",
-            max_tokens=200,
+            max_tokens=500,
             messages=[{
                 "role": "user",
                 "content": (
@@ -516,9 +516,11 @@ def claude_score(
                     "- Do not give high scores just because Python/SQL/cloud appear.\n"
                     + target_note
                     + signals_note
-                    + "\nReturn ONLY valid JSON:\n"
+                    + "\nReturn ONLY valid JSON. "
+                    "Limit matched_keywords to at most 8 items and missing_keywords to at most 8 items.\n"
                     '{"ats_score": <0-100>, "role_relevance": <0-100>, "job_family": "applied_ai_ml|data_engineering|software|analytics|consulting|infra_admin|other", '
-                    '"matched_keywords": [], "missing_keywords": [<JD must-have skills absent from resume>], '
+                    '"matched_keywords": [<up to 8 key skills from JD found in resume>], '
+                    '"missing_keywords": [<up to 8 JD must-have skills absent from resume>], '
                     '"exclude_by_default": true|false, "exclude_reason": "", "confidence": <0-100>}\n\n'
                     f"Resume:\n{resume_text[:2000]}\n\n"
                     f"Job title:\n{job_title[:200]}\n\n"
@@ -532,7 +534,7 @@ def claude_score(
             stop_reason = getattr(msg, "stop_reason", None)
             logger.warning(
                 "claude_score: no JSON object in response; response_len=%s stop_reason=%s "
-                "max_tokens=200 raw_preview=%r job_title=%r",
+                "max_tokens=500 raw_preview=%r job_title=%r",
                 len(raw_text), stop_reason, raw_text[:300], (job_title or "")[:80],
             )
             return _SCORE_FAILED

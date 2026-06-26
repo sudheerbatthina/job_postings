@@ -1761,6 +1761,37 @@ def test_claude_score_valid_json_returns_real_score():
     assert result.get("used_fallback_score") is not True
 
 
+def test_claude_score_long_keyword_lists_parse_successfully():
+    """Regression: a verbose response with 15+ matched_keywords must parse without
+    truncation at the old 200-token limit — this is the exact failure mode that
+    caused 100% fallback-score usage in production."""
+    long_matched = ["LLM", "RAG", "PyTorch", "LangChain", "embeddings", "vector search",
+                    "fine-tuning", "MLOps", "AWS SageMaker", "FastAPI", "Docker",
+                    "Kubernetes", "OpenAI API", "LangGraph", "Agentic AI"]
+    long_missing = ["Spark", "Airflow", "Snowflake", "dbt", "Redshift",
+                    "Kafka", "Terraform", "GCP", "Azure ML"]
+    raw = json.dumps({
+        "ats_score": 82,
+        "role_relevance": 88,
+        "job_family": "applied_ai_ml",
+        "matched_keywords": long_matched,
+        "missing_keywords": long_missing,
+        "exclude_by_default": False,
+        "exclude_reason": "",
+        "confidence": 85,
+    })
+    result = scoring.claude_score(
+        "Senior Applied AI Engineer — LLM, RAG, MLOps, Kubernetes.",
+        "Python LLM RAG LangChain PyTorch embeddings MLOps AWS Docker",
+        ["LLM", "RAG", "PyTorch"],
+        5,
+        _ClaudeClient(raw),
+    )
+    assert result["ats_score"] == 82
+    assert len(result["matched_keywords"]) == 15
+    assert result.get("used_fallback_score") is not True
+
+
 def test_fallback_score_count_surfaces_in_run_message(monkeypatch):
     """When Claude scoring fails for all jobs, 'fallback scoring used' appears in the done message."""
     def always_fail_claude(*args, **kwargs):

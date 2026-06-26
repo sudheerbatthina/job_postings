@@ -114,7 +114,7 @@ def _log_parse_failure(reason: str, raw_text: str, message=None) -> None:
     stop_reason = getattr(message, "stop_reason", None)
     logger.warning(
         "extract_keywords parse failed: reason=%s response_len=%s content_blocks=%s "
-        "stop_reason=%s max_tokens=300 raw_preview=%r",
+        "stop_reason=%s max_tokens=500 raw_preview=%r",
         reason,
         len(raw_text or ""),
         block_count,
@@ -275,7 +275,7 @@ def extract_keywords(text: str, client: "_anthropic.Anthropic | None") -> dict:
         try:
             msg = client.messages.create(
                 model="claude-haiku-4-5",
-                max_tokens=300,
+                max_tokens=500,
                 messages=[{
                     "role": "user",
                     "content": (
@@ -283,14 +283,17 @@ def extract_keywords(text: str, client: "_anthropic.Anthropic | None") -> dict:
                         'Use exactly this shape: {"search_titles": [], "skill_signals": [], '
                         '"total_yoe": null, "target_profile": {"primary_track": "applied_ai_ml", '
                         '"target_titles": [], "must_have_signals": [], "secondary_signals": []}}\n'
-                        "search_titles must be real job titles to search job boards with. "
+                        "search_titles: at most 6 real job titles suitable for job-board search boxes. "
                         "Never put tools, libraries, frameworks, vendors, concepts, or skill phrases "
                         "in search_titles. Bad search_titles include MCP tool, semantic reranking, "
                         "LangGraph OpenAI, OpenAI agents, and agents SDK.\n"
-                        "skill_signals must be tools, skills, platforms, or technical concepts only. "
+                        "skill_signals: at most 12 tools, skills, platforms, or technical concepts. "
                         "total_yoe must be an integer estimate of professional years of experience, "
-                        "or null if unclear. target_profile must describe the candidate's intended "
-                        "role family. For Applied AI, AI/ML, LLM, GenAI, Agentic AI, RAG, or MLOps "
+                        "or null if unclear. "
+                        "target_profile.target_titles: at most 8 titles. "
+                        "target_profile.must_have_signals: at most 8 signals. "
+                        "target_profile.secondary_signals: at most 8 signals. "
+                        "For Applied AI, AI/ML, LLM, GenAI, Agentic AI, RAG, or MLOps "
                         "engineering resumes, use primary_track applied_ai_ml and target_titles such "
                         "as Applied AI Engineer, AI Engineer, AI/ML Engineer, Machine Learning "
                         "Engineer, ML Engineer, GenAI Engineer, LLM Engineer, Agentic AI Engineer, "
