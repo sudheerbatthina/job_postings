@@ -6,6 +6,7 @@ export default function UploadForm({ onSubmit }) {
   const [file, setFile] = useState(null);
   const [location, setLocation] = useState("United States");
   const [isRemote, setIsRemote] = useState(false);
+  const [resultLimit, setResultLimit] = useState(10);
 
   const onDrop = useCallback((accepted) => {
     if (accepted[0]) setFile(accepted[0]);
@@ -24,7 +25,7 @@ export default function UploadForm({ onSubmit }) {
   const handleSubmit = (e) => {
     e.preventDefault();
     if (!file) return;
-    onSubmit({ file, location, isRemote });
+    onSubmit({ file, location, isRemote, resultLimit });
   };
 
   return (
@@ -71,7 +72,7 @@ export default function UploadForm({ onSubmit }) {
         )}
       </div>
 
-      <div className="mt-6">
+      <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
         <label className="flex flex-col gap-1.5">
           <span className="text-sm font-medium text-stone-700">Location</span>
           <input
@@ -80,6 +81,18 @@ export default function UploadForm({ onSubmit }) {
             onChange={(e) => setLocation(e.target.value)}
             className="rounded-lg border border-stone-300 px-3 py-2 text-stone-900 focus:outline-none focus:ring-2 focus:ring-teal-700/40 focus:border-teal-700"
           />
+        </label>
+        <label className="flex flex-col gap-1.5">
+          <span className="text-sm font-medium text-stone-700">Results</span>
+          <select
+            value={resultLimit}
+            onChange={(e) => setResultLimit(Number(e.target.value))}
+            className="rounded-lg border border-stone-300 px-3 py-2 text-stone-900 focus:outline-none focus:ring-2 focus:ring-teal-700/40 focus:border-teal-700"
+          >
+            <option value={10}>10 jobs</option>
+            <option value={20}>20 jobs</option>
+            <option value={30}>30 jobs</option>
+          </select>
         </label>
       </div>
 

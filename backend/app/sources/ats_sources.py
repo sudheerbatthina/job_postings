@@ -8,6 +8,7 @@ import pandas as pd
 import requests
 
 from .. import config
+from .. import freshness
 from ..company_registry import COMPANIES
 
 
@@ -33,9 +34,24 @@ def _remote_from_location(location: str | None) -> bool:
     return "remote" in str(location or "").lower()
 
 
+def _first_posted_value(job: dict, keys: tuple[str, ...]):
+    for key in keys:
+        value = job.get(key)
+        if value:
+            return value
+    return None
+
+
+def _posted_fields(job: dict, keys: tuple[str, ...]) -> dict:
+    raw = _first_posted_value(job, keys)
+    return freshness.normalize_posted_fields({"posted_at_raw": raw, "date_posted": raw})
+
+
 def normalize_greenhouse_job(job: dict, company: str, slug: str | None = None) -> dict:
     location = (job.get("location") or {}).get("name") if isinstance(job.get("location"), dict) else job.get("location")
     absolute_url = job.get("absolute_url")
+    posted = _posted_fields(job, ("first_published", "published_at", "created_at", "updated_at"))
+    applicants = freshness.extract_applicant_signal(job, _strip_html(job.get("content")))
     return {
         "source": "greenhouse",
         "source_type": "greenhouse",
@@ -43,10 +59,12 @@ def normalize_greenhouse_job(job: dict, company: str, slug: str | None = None) -
         "company": company,
         "location": location,
         "is_remote": _remote_from_location(location),
-        "date_posted": job.get("updated_at") or job.get("created_at"),
+        "date_posted": posted["posted_at_ts"] or posted["posted_at_raw"],
+        **posted,
         "job_url": absolute_url or f"https://boards.greenhouse.io/{slug or company}",
         "apply_url": absolute_url,
         "description": _strip_html(job.get("content")),
+        **applicants,
         "raw_json": job,
     }
 
@@ -60,6 +78,8 @@ def normalize_lever_job(job: dict, company: str) -> dict:
         for section in (job.get("lists") or [])
         if isinstance(section, dict)
     )
+    posted = _posted_fields(job, ("firstPublishedAt", "publishedAt", "createdAt", "updatedAt", "created_at"))
+    applicants = freshness.extract_applicant_signal(job, description or _strip_html(job.get("description")))
     return {
         "source": "lever",
         "source_type": "lever",
@@ -67,10 +87,12 @@ def normalize_lever_job(job: dict, company: str) -> dict:
         "company": company,
         "location": location,
         "is_remote": _remote_from_location(f"{location} {job.get('workplaceType')}"),
-        "date_posted": None,
+        "date_posted": posted["posted_at_ts"] or posted["posted_at_raw"],
+        **posted,
         "job_url": apply_url or job.get("id"),
         "apply_url": apply_url,
         "description": description or _strip_html(job.get("description")),
+        **applicants,
         "raw_json": job,
     }
 
@@ -78,6 +100,11 @@ def normalize_lever_job(job: dict, company: str) -> dict:
 def normalize_ashby_job(job: dict, company: str) -> dict:
     location = job.get("locationName") or job.get("location")
     apply_url = job.get("jobUrl") or job.get("hostedUrl") or job.get("applyUrl")
+    posted = _posted_fields(job, ("publishedAt", "createdAt", "updatedAt", "listedAt", "firstPublishedAt"))
+    applicants = freshness.extract_applicant_signal(
+        job,
+        _strip_html(job.get("descriptionHtml") or job.get("descriptionPlain")),
+    )
     return {
         "source": "ashby",
         "source_type": "ashby",
@@ -85,10 +112,12 @@ def normalize_ashby_job(job: dict, company: str) -> dict:
         "company": company,
         "location": location,
         "is_remote": _remote_from_location(location),
-        "date_posted": job.get("publishedAt"),
+        "date_posted": posted["posted_at_ts"] or posted["posted_at_raw"],
+        **posted,
         "job_url": apply_url or job.get("id"),
         "apply_url": apply_url,
         "description": _strip_html(job.get("descriptionHtml") or job.get("descriptionPlain")),
+        **applicants,
         "raw_json": job,
     }
 

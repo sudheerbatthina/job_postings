@@ -6,11 +6,12 @@ import asyncio
 import json
 import time
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
-from app import main, resume_parser, scraper as scraper_mod
+from app import freshness, main, resume_parser, scraper as scraper_mod
 from app.sources import ats_sources, google_jobs_serpapi
 
 
@@ -565,6 +566,43 @@ def test_scraper_never_runs_with_empty_search_titles(monkeypatch, tmp_path):
     assert captured_terms[0] == main.config.DEFAULT_STEM_SEARCH_TITLES
 
 
+def test_parse_relative_posted_at_minutes_and_hours():
+    ref = datetime(2026, 6, 26, 12, 0, tzinfo=timezone.utc)
+
+    cases = [
+        ("2 minutes ago", 2, "minute", "Posted 2 min ago"),
+        ("49 minutes ago", 49, "minute", "Posted 49 min ago"),
+        ("1 hour ago", 60, "hour", "Posted 1 hr ago"),
+        ("21 hours ago", 1260, "hour", "Posted 21 hrs ago"),
+    ]
+
+    for raw, minutes, precision, label in cases:
+        parsed = freshness.parse_relative_posted_at(raw, ref)
+        assert parsed["posted_age_minutes"] == minutes
+        assert parsed["posted_precision"] == precision
+        assert freshness.build_posted_age_label(parsed["posted_at_ts"], precision, ref) == label
+
+
+def test_date_only_jobspy_job_uses_day_precision(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
+    now = datetime.now(timezone.utc).isoformat()
+    df = pd.DataFrame([{
+        "title": "AI Engineer",
+        "company": "DateOnly",
+        "location": "Remote",
+        "site": "indeed",
+        "description": "Python RAG",
+        "date_posted": date.today(),
+        "job_url": "http://date-only/1",
+    }])
+
+    main.job_cache.upsert_jobs(df, scraped_at=now)
+    recent = main.job_cache.get_recent_jobs(24)
+
+    assert recent.iloc[0]["posted_precision"] == "day"
+    assert recent.iloc[0]["posted_age_label"] == "Posted today"
+
+
 def test_job_cache_upserts_and_reads_recent_jobs(monkeypatch, tmp_path):
     monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
     now = datetime.now(timezone.utc).isoformat()
@@ -712,6 +750,38 @@ def test_greenhouse_lever_ashby_google_job_normalization():
     assert ashby["is_remote"] is True
     assert google["source_type"] == "google_jobs"
     assert google["apply_url"] == "https://acme.com/jobs/4"
+
+
+def test_serpapi_posted_at_and_applicants_are_normalized():
+    ref = datetime(2026, 6, 26, 12, 0, tzinfo=timezone.utc)
+    row = google_jobs_serpapi.normalize_google_job({
+        "title": "AI Engineer",
+        "company_name": "Acme",
+        "location": "Remote",
+        "description": "Build LLM systems.",
+        "detected_extensions": {
+            "posted_at": "49 minutes ago",
+            "applicants": "Less than 25 applicants",
+        },
+        "apply_options": [{"link": "https://acme.com/jobs/ai"}],
+        "share_link": "https://www.google.com/search?ibp=htl;jobs",
+    }, "AI Engineer", ref)
+
+    assert row["posted_at_raw"] == "49 minutes ago"
+    assert row["posted_age_minutes"] == 49
+    assert row["posted_precision"] == "minute"
+    assert row["posted_age_label"] == "Posted 49 min ago"
+    assert row["applicants_label"] == "Less than 25 applicants"
+    assert row["applicant_precision"] == "range"
+    assert row["job_url"] == "https://acme.com/jobs/ai"
+
+
+def test_missing_applicant_count_stays_null():
+    signal = freshness.extract_applicant_signal({}, "Build AI systems.", {})
+
+    assert signal["applicants_count"] is None
+    assert signal["applicants_label"] is None
+    assert signal["applicant_precision"] == "unknown"
 
 
 def test_source_counts_are_stored_on_cache_refresh(monkeypatch, tmp_path):
@@ -1305,6 +1375,74 @@ def _run_with_cached_jobs(monkeypatch, jobs: pd.DataFrame, score_map: dict[str, 
         return _wait_for_done(c, r.json()["job_id"])
 
 
+def _many_good_jobs(n: int = 35) -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "title": f"Applied AI Engineer {i}",
+            "company": f"GoodCo {i}",
+            "location": "Remote",
+            "date_posted": date.today(),
+            "is_remote": True,
+            "job_url": f"http://limit/{i}",
+            "description": "Build LLM RAG systems with embeddings vector search Python MLOps.",
+        }
+        for i in range(n)
+    ])
+
+
+def _run_limit_case(monkeypatch, data: dict) -> dict:
+    jobs = _many_good_jobs()
+    _install_cache_fakes(monkeypatch, get_recent_jobs=lambda hours_old: jobs, count_jobs=len(jobs))
+    monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
+    monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
+    monkeypatch.setattr(main.resume_parser, "extract_keywords", lambda text, client: _FAKE_KW)
+    monkeypatch.setattr(main.scoring, "score_with_claude", _fake_score_with_claude)
+
+    payload = {"location": "United States", "is_remote": "false", "hours_old": "24"}
+    payload.update(data)
+    with TestClient(main.app) as c:
+        r = c.post(
+            "/api/analyze",
+            files={"resume": ("resume.txt", b"Applied AI LLM RAG MLOps Python", "text/plain")},
+            data=payload,
+        )
+        assert r.status_code == 200, r.text
+        return _wait_for_done(c, r.json()["job_id"])
+
+
+def test_missing_result_limit_defaults_to_10(monkeypatch):
+    body = _run_limit_case(monkeypatch, {})
+
+    assert body["status"] == "done", body
+    assert len(body["results"]) <= 10
+    assert len(body["results"]) == 10
+    assert "Result limit: 10" in body["message"]
+
+
+def test_invalid_result_limit_falls_back_to_10(monkeypatch):
+    body = _run_limit_case(monkeypatch, {"result_limit": "not-a-number"})
+
+    assert body["status"] == "done", body
+    assert len(body["results"]) == 10
+    assert "Result limit: 10" in body["message"]
+
+
+def test_result_limit_20_returns_at_most_20(monkeypatch):
+    body = _run_limit_case(monkeypatch, {"result_limit": "20"})
+
+    assert body["status"] == "done", body
+    assert len(body["results"]) == 20
+    assert "Result limit: 20" in body["message"]
+
+
+def test_result_limit_30_returns_at_most_30(monkeypatch):
+    body = _run_limit_case(monkeypatch, {"result_limit": "30"})
+
+    assert body["status"] == "done", body
+    assert len(body["results"]) == 30
+    assert "Result limit: 30" in body["message"]
+
+
 def test_jobs_older_than_72h_excluded_from_main_and_broader_results(monkeypatch):
     jobs = pd.DataFrame([
         {
@@ -1479,12 +1617,28 @@ def test_does_not_fill_top_10_with_bad_jobs(monkeypatch):
 
 
 def test_frontend_default_min_score_is_65():
-    source = (main.__file__)
-    frontend_path = source.split("backend")[0] + "frontend/src/components/ResultsTable.jsx"
+    frontend_path = Path(__file__).resolve().parents[2] / "frontend" / "src" / "components" / "ResultsTable.jsx"
     with open(frontend_path, encoding="utf-8") as f:
         text = f.read()
     assert "useState(65)" in text
     assert "ATS match" in text
+
+
+def test_frontend_sends_selected_result_limit():
+    root = Path(__file__).resolve().parents[2]
+    with open(root / "frontend" / "src" / "api.js", encoding="utf-8") as f:
+        api_text = f.read()
+    with open(root / "frontend" / "src" / "components" / "UploadForm.jsx", encoding="utf-8") as f:
+        upload_text = f.read()
+    with open(root / "frontend" / "src" / "components" / "ReadyToSearch.jsx", encoding="utf-8") as f:
+        ready_text = f.read()
+
+    assert "resultLimit = 10" in api_text
+    assert 'form.append("result_limit", resultLimit)' in api_text
+    assert "useState(10)" in upload_text
+    assert "useState(10)" in ready_text
+    assert "20 jobs" in upload_text
+    assert "30 jobs" in ready_text
 
 
 def test_glassdoor_location_filtering(monkeypatch):

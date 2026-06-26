@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 import pandas as pd
 
-from . import config
+from . import config, freshness
 
 if TYPE_CHECKING:
     import anthropic as _anthropic
@@ -147,25 +147,25 @@ def freshness_for_date(value) -> dict:
     if posted is None:
         return {
             "posted_age_days": None,
-            "posted_age_label": "Unknown date",
+            "posted_age_label": None,
             "freshness_bucket": "unknown",
             "freshness_score": 0.25,
         }
     days = max(0, (date.today() - posted).days)
     if days == 0:
-        label = "Today"
+        label = "Posted today"
         bucket = "24h"
         freshness = 1.0
     elif days == 1:
-        label = "Yesterday"
+        label = "Posted yesterday"
         bucket = "72h"
         freshness = 0.85
     elif days <= 3:
-        label = f"{days} days ago"
+        label = f"Posted {days} days ago"
         bucket = "72h"
         freshness = 0.72
     else:
-        label = f"{days} days ago"
+        label = f"Posted {days} days ago"
         bucket = "old"
         freshness = 0.10
     return {
@@ -180,11 +180,24 @@ def add_freshness_metadata(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.copy()
-    if "date_posted" not in df.columns:
-        df["date_posted"] = None
-    meta = [freshness_for_date(value) for value in df["date_posted"]]
-    for key in ("posted_age_days", "posted_age_label", "freshness_bucket", "freshness_score"):
-        df[key] = [item[key] for item in meta]
+    records = []
+    for _, row in df.iterrows():
+        if row.get("posted_at_ts") is not None or row.get("posted_at_raw") is not None or row.get("date_posted") is not None:
+            meta = freshness.normalize_posted_fields(row.to_dict())
+            bucket = meta["freshness_bucket"]
+            freshness_score = 1.0 if bucket == "24h" else 0.72 if bucket == "72h" else 0.10 if bucket == "old" else 0.25
+            age_days = None if meta["posted_age_minutes"] is None else int(meta["posted_age_minutes"] // 1440)
+            meta["posted_age_days"] = age_days
+            meta["freshness_score"] = freshness_score
+            records.append(meta)
+        else:
+            meta = freshness_for_date(row.get("date_posted"))
+            records.append(meta)
+    for key in (
+        "posted_at_raw", "posted_at_ts", "posted_age_minutes", "posted_age_label",
+        "posted_precision", "freshness_bucket", "posted_age_days", "freshness_score",
+    ):
+        df[key] = [item.get(key) for item in records]
     return df
 
 
@@ -393,7 +406,7 @@ def fallback_score_row(row, resume_tokens: set[str] | None, window_hours: int) -
     """Cheap non-AI score so Claude/API failures still return ranked jobs."""
     title = row.get("title", "") if hasattr(row, "get") else ""
     desc = row.get("description", "") if hasattr(row, "get") else ""
-    date_posted = row.get("date_posted") if hasattr(row, "get") else None
+    date_posted = row.get("posted_at_ts") or row.get("date_posted") if hasattr(row, "get") else None
     kw = keyword_score(title, desc)
     resume = resume_score(desc, resume_tokens or set())
     recency = recency_score(date_posted, window_hours)
@@ -409,15 +422,29 @@ def sort_scored(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.copy()
-    if "date_posted" not in df.columns:
-        df["date_posted"] = None
-    df["_sort_date"] = pd.to_datetime(df["date_posted"], errors="coerce")
+    if "posted_age_minutes" not in df.columns:
+        df["posted_age_minutes"] = None
+    if "source_type" not in df.columns:
+        df["source_type"] = df.get("source", "")
+    source_priority = {
+        "greenhouse": 1,
+        "lever": 1,
+        "ashby": 1,
+        "workday": 1,
+        "company_portal": 1,
+        "linkedin": 2,
+        "google_jobs": 3,
+        "google": 3,
+        "indeed": 4,
+    }
+    df["_sort_age"] = pd.to_numeric(df["posted_age_minutes"], errors="coerce")
+    df["_source_priority"] = df["source_type"].fillna("").astype(str).str.lower().map(source_priority).fillna(9)
     df = df.sort_values(
-        ["ats_score", "_sort_date"],
-        ascending=[False, False],
+        ["ats_score", "_sort_age", "_source_priority"],
+        ascending=[False, True, True],
         na_position="last",
     )
-    return df.drop(columns=["_sort_date"]).reset_index(drop=True)
+    return df.drop(columns=["_sort_age", "_source_priority"]).reset_index(drop=True)
 
 
 def fallback_score_dataframe(

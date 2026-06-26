@@ -97,7 +97,8 @@ async def analyze(
     location: str = Form("United States"),
     is_remote: bool = Form(False),
     hours_old: int = Form(config.DEFAULT_HOURS_OLD),
-    top_results: int = Form(config.TOP_RESULTS),
+    result_limit: str | None = Form(None),
+    top_results: str | None = Form(None),
 ):
     if resume is not None:
         content: bytes | None = await resume.read()
@@ -113,8 +114,9 @@ async def analyze(
         content = None  # signals _run_analysis to use stored resume directly
 
     job_id = jobs_store.create_job()
+    limit = _validate_result_limit(result_limit if result_limit is not None else top_results)
     asyncio.create_task(
-        _run_analysis(job_id, filename, content, location, is_remote, hours_old, top_results)
+        _run_analysis(job_id, filename, content, location, is_remote, hours_old, limit)
     )
     return {"job_id": job_id}
 
@@ -157,6 +159,20 @@ def _resume_tokens_from_text(resume_text: str) -> set[str]:
         t for t in re.findall(r"[a-zA-Z][a-zA-Z+#.\-]{2,}", resume_text.lower())
         if t not in config.STOPWORDS
     }
+
+
+def _validate_result_limit(value) -> int:
+    if value is None or value == "":
+        return config.DEFAULT_RESULT_LIMIT
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return config.DEFAULT_RESULT_LIMIT
+    if limit > config.MAX_RESULT_LIMIT:
+        return config.MAX_RESULT_LIMIT
+    if limit in config.ALLOWED_RESULT_LIMITS:
+        return limit
+    return config.DEFAULT_RESULT_LIMIT
 
 
 def _cache_analysis_version(stored: dict | None) -> int:
@@ -217,7 +233,7 @@ async def _run_cached_search(
     location: str,
     is_remote: bool,
     hours_old: int,
-    top_results: int,
+    result_limit: int,
     trail: list[str],
 ) -> None:
     windows = [config.DEFAULT_HOURS_OLD] + [
@@ -238,6 +254,7 @@ async def _run_cached_search(
     source_counts = await asyncio.to_thread(job_cache.get_latest_source_counts)
     age_label = "unknown" if cache_age is None else f"{cache_age:.1f}m"
     trail.append(f"Job cache age: {age_label}; cached jobs: {cache_count}")
+    trail.append(f"Result limit: {result_limit}")
     trail.append(f"Max job age: {config.MAX_JOB_AGE_HOURS}h")
     trail.append(f"Cache jobs pruned: {pruned_count}")
     trail.append(job_cache.format_source_counts(source_counts))
@@ -275,7 +292,7 @@ async def _run_cached_search(
         _update_trail(job_id, trail)
         raw_df = candidate_df
         selected_window = window
-        if len(candidate_df) >= top_results:
+        if len(candidate_df) >= result_limit:
             break
 
     if raw_df.empty:
@@ -298,7 +315,7 @@ async def _run_cached_search(
     trail.append(f"Jobs after role filter: {allowed_count}")
     _update_trail(job_id, trail)
 
-    if allowed_count < top_results:
+    if allowed_count < result_limit:
         cache_refreshed = True
         target_titles = target_profile.get("target_titles") or config.DEFAULT_SEARCH_TITLES
         trail.append("Refreshing job cache with target AI/ML titles")
@@ -351,7 +368,7 @@ async def _run_cached_search(
         )
         if not low_confidence.empty:
             low_confidence = low_confidence[low_confidence["match_band"] == "broader"]
-        low_confidence = scoring.dedupe_display_jobs(scoring.sort_scored(low_confidence)).head(top_results)
+        low_confidence = scoring.dedupe_display_jobs(scoring.sort_scored(low_confidence)).head(result_limit)
         jobs_store.set_results(
             job_id,
             pd.DataFrame(),
@@ -366,8 +383,8 @@ async def _run_cached_search(
             unseen_df = unseen_df.copy()
             unseen_df["seen_before"] = False
         trail.append(f"Unseen cached jobs: {len(unseen_df)}")
-        if len(unseen_df) < top_results and not seen_df.empty:
-            needed = top_results - len(unseen_df)
+        if len(unseen_df) < result_limit and not seen_df.empty:
+            needed = result_limit - len(unseen_df)
             candidate_df = pd.concat([unseen_df, seen_df.head(needed)], ignore_index=True)
             used_seen_fallback = True
             trail.append(f"Seen-fill jobs: {min(needed, len(seen_df))}")
@@ -458,11 +475,11 @@ async def _run_cached_search(
         scoring.dedupe_display_jobs(scoring.sort_scored(pd.concat(low_parts, ignore_index=True)))
         if low_parts
         else pd.DataFrame()
-    ).head(top_results).reset_index(drop=True)
+    ).head(result_limit).reset_index(drop=True)
     if not low_confidence.empty:
         low_confidence = low_confidence[low_confidence["match_band"] == "broader"].reset_index(drop=True)
 
-    final = scoring.sort_scored(strong).head(top_results).reset_index(drop=True)
+    final = scoring.sort_scored(strong).head(result_limit).reset_index(drop=True)
     final.insert(0, "rank", range(1, len(final) + 1))
     if not low_confidence.empty:
         low_confidence.insert(0, "rank", range(1, len(low_confidence) + 1))
@@ -486,7 +503,7 @@ async def _run_cached_search(
     n = len(final)
     if n == 0:
         done_msg = "No strong AI/ML matches from the last 3 days."
-    elif n < top_results:
+    elif n < result_limit:
         done_msg = f"Found {n} strong AI/ML match{'' if n == 1 else 'es'}. Lower the score filter to see broader roles."
     else:
         done_msg = f"Found {n} strong AI/ML match{'' if n == 1 else 'es'}"
@@ -503,7 +520,7 @@ async def _run_analysis(
     location: str,
     is_remote: bool,
     hours_old: int,
-    top_results: int = config.TOP_RESULTS,
+    result_limit: int = config.DEFAULT_RESULT_LIMIT,
 ) -> None:
     try:
         # Step 1: Resume — use cache if same filename, else parse + extract keywords
@@ -597,7 +614,7 @@ async def _run_analysis(
             location=location,
             is_remote=is_remote,
             hours_old=hours_old,
-            top_results=top_results,
+            result_limit=result_limit,
             trail=trail,
         )
         return

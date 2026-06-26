@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 import pandas as pd
 
-from . import config, scraper
+from . import config, freshness, scraper
 from .sources import ats_sources, google_jobs_serpapi
 
 SOURCE_COUNT_KEYS = [
@@ -85,6 +85,16 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
         ("apply_url", "TEXT"),
         ("is_linkedin_easy_apply", "INTEGER DEFAULT 0"),
         ("excluded_reason", "TEXT"),
+        ("posted_at_raw", "TEXT"),
+        ("posted_at_ts", "TEXT"),
+        ("posted_age_minutes", "INTEGER"),
+        ("posted_age_label", "TEXT"),
+        ("posted_precision", "TEXT"),
+        ("freshness_bucket", "TEXT"),
+        ("applicants_count", "INTEGER"),
+        ("applicants_label", "TEXT"),
+        ("applicant_precision", "TEXT"),
+        ("early_applicant", "INTEGER DEFAULT 0"),
     ):
         try:
             con.execute(f"ALTER TABLE jobs_cache ADD COLUMN {col} {typedef}")
@@ -214,6 +224,42 @@ def add_linkedin_easy_apply_metadata(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_freshness_metadata(df: pd.DataFrame, scraped_at: str | None = None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    reference_time = pd.to_datetime(scraped_at, errors="coerce", utc=True)
+    if pd.isna(reference_time):
+        reference_time = pd.Timestamp.now(tz="UTC")
+    posted_rows = []
+    applicant_rows = []
+    for _, row in df.iterrows():
+        data = row.to_dict()
+        posted_rows.append(freshness.normalize_posted_fields(data, reference_time.to_pydatetime()))
+        raw = data.get("raw_json") if isinstance(data.get("raw_json"), dict) else data
+        applicants = freshness.extract_applicant_signal(
+            raw,
+            data.get("description") or "",
+            raw.get("detected_extensions") if isinstance(raw, dict) else None,
+        )
+        applicant_rows.append(applicants)
+    for key in (
+        "posted_at_raw", "posted_at_ts", "posted_age_minutes", "posted_age_label",
+        "posted_precision", "freshness_bucket",
+    ):
+        df[key] = [item.get(key) for item in posted_rows]
+    for key in ("applicants_count", "applicants_label", "applicant_precision", "early_applicant"):
+        existing = df[key].tolist() if key in df.columns else [None] * len(df)
+        values = []
+        for current, extracted in zip(existing, applicant_rows):
+            if current not in (None, "", False) and not (isinstance(current, float) and pd.isna(current)):
+                values.append(current)
+            else:
+                values.append(extracted.get(key))
+        df[key] = values
+    return df
+
+
 def _source_priority(row) -> int:
     source_type = str(row.get("source_type") or row.get("source") or row.get("site") or "").lower()
     return SOURCE_PRIORITY.get(source_type, 9)
@@ -228,6 +274,7 @@ def normalize_jobspy_jobs(df: pd.DataFrame) -> pd.DataFrame:
     df["source_type"] = df["source"]
     if "apply_url" not in df.columns:
         df["apply_url"] = df.get("job_url")
+    df = add_freshness_metadata(df)
     return df
 
 
@@ -324,8 +371,8 @@ def upsert_jobs(df: pd.DataFrame, scraped_at: str | None = None) -> dict:
     if df is None or df.empty or "job_url" not in df.columns:
         return {"raw_count": 0, "inserted_count": 0, "updated_count": 0}
 
-    df = add_linkedin_easy_apply_metadata(dedupe_prefer_sources(df))
     now = scraped_at or _iso_now()
+    df = add_linkedin_easy_apply_metadata(add_freshness_metadata(dedupe_prefer_sources(df), now))
     inserted = 0
     updated = 0
 
@@ -354,6 +401,16 @@ def upsert_jobs(df: pd.DataFrame, scraped_at: str | None = None) -> dict:
                 now,
                 1 if bool(_row_value(row, "is_linkedin_easy_apply")) else 0,
                 _row_value(row, "excluded_reason") or _row_value(row, "exclude_reason"),
+                _row_value(row, "posted_at_raw"),
+                _row_value(row, "posted_at_ts"),
+                _row_value(row, "posted_age_minutes"),
+                _row_value(row, "posted_age_label"),
+                _row_value(row, "posted_precision"),
+                _row_value(row, "freshness_bucket"),
+                _row_value(row, "applicants_count"),
+                _row_value(row, "applicants_label"),
+                _row_value(row, "applicant_precision"),
+                1 if bool(_row_value(row, "early_applicant")) else 0,
                 json.dumps(raw, default=str),
             )
             con.execute(
@@ -361,9 +418,12 @@ def upsert_jobs(df: pd.DataFrame, scraped_at: str | None = None) -> dict:
                 INSERT INTO jobs_cache (
                     job_url, title, company, location, source, source_type, site,
                     description, date_posted, apply_url, scraped_at, last_seen_at,
-                    is_linkedin_easy_apply, excluded_reason, raw_json
+                    is_linkedin_easy_apply, excluded_reason, posted_at_raw, posted_at_ts,
+                    posted_age_minutes, posted_age_label, posted_precision, freshness_bucket,
+                    applicants_count, applicants_label, applicant_precision, early_applicant,
+                    raw_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_url) DO UPDATE SET
                     title = excluded.title,
                     company = excluded.company,
@@ -377,6 +437,16 @@ def upsert_jobs(df: pd.DataFrame, scraped_at: str | None = None) -> dict:
                     last_seen_at = excluded.last_seen_at,
                     is_linkedin_easy_apply = excluded.is_linkedin_easy_apply,
                     excluded_reason = excluded.excluded_reason,
+                    posted_at_raw = excluded.posted_at_raw,
+                    posted_at_ts = excluded.posted_at_ts,
+                    posted_age_minutes = excluded.posted_age_minutes,
+                    posted_age_label = excluded.posted_age_label,
+                    posted_precision = excluded.posted_precision,
+                    freshness_bucket = excluded.freshness_bucket,
+                    applicants_count = excluded.applicants_count,
+                    applicants_label = excluded.applicants_label,
+                    applicant_precision = excluded.applicant_precision,
+                    early_applicant = excluded.early_applicant,
                     raw_json = excluded.raw_json
                 """,
                 values,
@@ -397,12 +467,14 @@ def upsert_jobs(df: pd.DataFrame, scraped_at: str | None = None) -> dict:
 def prune_old_jobs(max_age_hours: int = config.MAX_JOB_AGE_HOURS) -> int:
     cutoff = datetime.now(timezone.utc) - pd.Timedelta(hours=max_age_hours)
     with _conn() as con:
-        rows = con.execute("SELECT job_url, date_posted, scraped_at FROM jobs_cache").fetchall()
+        rows = con.execute("SELECT job_url, posted_at_ts, date_posted, scraped_at FROM jobs_cache").fetchall()
         old_urls = []
         for row in rows:
-            posted = pd.to_datetime(row["date_posted"], errors="coerce", utc=True)
+            posted = pd.to_datetime(row["posted_at_ts"], errors="coerce", utc=True)
+            fallback_posted = pd.to_datetime(row["date_posted"], errors="coerce", utc=True)
             scraped = pd.to_datetime(row["scraped_at"], errors="coerce", utc=True)
-            basis = posted if not pd.isna(posted) else scraped
+            basis = posted if not pd.isna(posted) else fallback_posted
+            basis = basis if not pd.isna(basis) else scraped
             if pd.isna(basis) or basis < cutoff:
                 old_urls.append(row["job_url"])
         if old_urls:
@@ -559,9 +631,11 @@ def get_recent_jobs(hours_old: int) -> pd.DataFrame:
     if df.empty:
         return df
 
-    posted = pd.to_datetime(df.get("date_posted"), errors="coerce", utc=True)
+    df = add_freshness_metadata(df)
+    posted = pd.to_datetime(df.get("posted_at_ts"), errors="coerce", utc=True)
+    fallback_posted = pd.to_datetime(df.get("date_posted"), errors="coerce", utc=True)
     scraped = pd.to_datetime(df.get("scraped_at"), errors="coerce", utc=True)
-    basis = posted.fillna(scraped)
+    basis = posted.fillna(fallback_posted).fillna(scraped)
     cutoff = datetime.now(timezone.utc) - pd.Timedelta(hours=hours_old)
     df = df[basis >= cutoff].copy()
     return df.reset_index(drop=True)

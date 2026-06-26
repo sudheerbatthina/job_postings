@@ -4,12 +4,13 @@ import { FileText, RotateCcw } from "lucide-react";
 export default function ReadyToSearch({ storedResume, onSubmit, onReplace }) {
   const [location, setLocation] = useState("United States");
   const [isRemote, setIsRemote] = useState(false);
+  const [resultLimit, setResultLimit] = useState(10);
 
   const searchTitles = storedResume?.search_titles || [];
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    onSubmit({ location, isRemote });
+    onSubmit({ location, isRemote, resultLimit });
   };
 
   return (
@@ -58,6 +59,18 @@ export default function ReadyToSearch({ storedResume, onSubmit, onReplace }) {
             Remote only
           </label>
         </div>
+        <label className="flex flex-col gap-1.5">
+          <span className="text-sm font-medium text-stone-700">Results</span>
+          <select
+            value={resultLimit}
+            onChange={(e) => setResultLimit(Number(e.target.value))}
+            className="rounded-lg border border-stone-300 px-3 py-2 text-stone-900 focus:outline-none focus:ring-2 focus:ring-teal-700/40 focus:border-teal-700"
+          >
+            <option value={10}>10 jobs</option>
+            <option value={20}>20 jobs</option>
+            <option value={30}>30 jobs</option>
+          </select>
+        </label>
       </div>
 
       <button

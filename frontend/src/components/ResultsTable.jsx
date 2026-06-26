@@ -37,6 +37,12 @@ function bandLabel(band) {
   return "Match";
 }
 
+function resultHeading(results, showBroader) {
+  if (showBroader) return "broader";
+  const allStrong = results.length > 0 && results.every((job) => job.match_band === "strong");
+  return allStrong ? "strong" : "good AI/ML";
+}
+
 export default function ResultsTable({ results, lowConfidenceResults = [], jobId, onReset }) {
   const [minScore, setMinScore] = useState(65);
   const [remoteOnly, setRemoteOnly] = useState(false);
@@ -71,7 +77,7 @@ export default function ResultsTable({ results, lowConfidenceResults = [], jobId
     <div className="w-full max-w-3xl mx-auto">
       <div className="flex items-center justify-between flex-wrap gap-3">
         <h2 className="text-xl font-semibold text-stone-900">
-          {filtered.length} {showBroader ? "broader" : "strong/good AI/ML"} match{filtered.length === 1 ? "" : "es"}
+          {filtered.length} {resultHeading(filtered, showBroader)} match{filtered.length === 1 ? "" : "es"}
         </h2>
         <div className="flex items-center gap-3">
           <a
@@ -141,6 +147,15 @@ export default function ResultsTable({ results, lowConfidenceResults = [], jobId
           const salary = salaryLabel(job.min_amount, job.max_amount);
           const missing = job.missing_keywords || [];
           const isExpanded = expandedUrl === job.job_url;
+          const applyHref = job.apply_url || job.job_url;
+          const meta = [
+            job.company,
+            job.location,
+            job.posted_age_label || relativeTime(job.date_posted),
+            job.applicants_label,
+            salary,
+          ].filter(Boolean);
+          const sourceLabel = job.source_type || job.source;
           return (
             <li
               key={job.job_url}
@@ -156,13 +171,11 @@ export default function ResultsTable({ results, lowConfidenceResults = [], jobId
                 <div className="flex-1 min-w-0">
                   <p className="font-medium text-stone-900 truncate">{job.title}</p>
                   <p className="text-sm text-stone-500 truncate">
-                    {job.company} · {job.location} · {relativeTime(job.date_posted)}
-                    {salary ? ` · ${salary}` : ""}
+                    {meta.join(" · ")}
                   </p>
                   <p className="text-xs text-stone-400 truncate">
                     {bandLabel(job.match_band)} match
-                    {job.posted_age_label ? ` · ${job.posted_age_label}` : ""}
-                    {job.source ? ` · ${job.source}` : ""}
+                    {sourceLabel ? ` · ${sourceLabel}` : ""}
                   </p>
                   {showBroader && job.exclude_reason && (
                     <p className="text-xs text-amber-700 truncate">{job.exclude_reason}</p>
@@ -181,7 +194,7 @@ export default function ResultsTable({ results, lowConfidenceResults = [], jobId
                     </button>
                   )}
                   <a
-                    href={job.job_url}
+                    href={applyHref}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="flex items-center gap-1.5 rounded-md bg-stone-900 px-3 py-2 text-sm font-medium text-white hover:bg-stone-700"
