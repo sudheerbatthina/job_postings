@@ -278,7 +278,17 @@ def normalize_jobspy_jobs(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+_PRECISION_ORDER = {"minute": 0, "hour": 1, "day": 2, "unknown": 9}
+
+
 def dedupe_prefer_sources(df: pd.DataFrame) -> pd.DataFrame:
+    """Dedup by apply-URL then by (title, company, location).
+
+    Within a tie, prefer lower source priority (ATS > LinkedIn > Google > Indeed).
+    Secondary tiebreaker: prefer the record with the most precise posted-at timestamp
+    (minute > hour > day > unknown) so the displayed "X min ago" is as accurate as
+    possible.  The apply-URL preference (ATS wins) is handled by the primary sort key.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
@@ -286,18 +296,28 @@ def dedupe_prefer_sources(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = ""
     df["_priority"] = df.apply(_source_priority, axis=1)
+    _prec_col = "posted_precision" if "posted_precision" in df.columns else None
+    if _prec_col:
+        df["_precision_priority"] = (
+            df[_prec_col].fillna("unknown").astype(str).str.lower()
+            .map(_PRECISION_ORDER).fillna(9)
+        )
+    else:
+        df["_precision_priority"] = 9
     df["_canonical_apply"] = df["apply_url"].fillna(df["job_url"]).apply(_canonical_url)
     df["_display_key"] = (
         df["title"].apply(_normal_text) + "|"
         + df["company"].apply(_normal_text) + "|"
         + df["location"].apply(_normal_text)
     )
-    df = df.sort_values("_priority", ascending=True)
+    df = df.sort_values(["_priority", "_precision_priority"], ascending=[True, True])
     with_apply = df[df["_canonical_apply"] != ""].drop_duplicates("_canonical_apply")
     without_apply = df[df["_canonical_apply"] == ""]
     df = pd.concat([with_apply, without_apply], ignore_index=True)
-    df = df.sort_values("_priority", ascending=True).drop_duplicates("_display_key")
-    return df.drop(columns=["_priority", "_canonical_apply", "_display_key"]).reset_index(drop=True)
+    df = df.sort_values(["_priority", "_precision_priority"], ascending=[True, True]).drop_duplicates("_display_key")
+    return df.drop(
+        columns=["_priority", "_precision_priority", "_canonical_apply", "_display_key"]
+    ).reset_index(drop=True)
 
 
 def source_counts_from_df(df: pd.DataFrame) -> dict:

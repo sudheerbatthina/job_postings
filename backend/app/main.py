@@ -299,7 +299,7 @@ async def _run_cached_search(
         jobs_store.set_results(
             job_id,
             pd.DataFrame(),
-            message="No strong AI/ML matches from the last 3 days.",
+            message="No strong AI/ML matches from the last 30 hours.",
             low_confidence_df=pd.DataFrame(),
         )
         return
@@ -355,8 +355,8 @@ async def _run_cached_search(
     old_allowed = allowed_pool[~normal_mask].copy()
     if not old_allowed.empty:
         old_allowed["exclude_by_default"] = True
-        old_allowed["exclude_reason"] = "job is older than 3 days"
-        old_allowed["excluded_reason"] = "job is older than 3 days"
+        old_allowed["exclude_reason"] = "job is older than 30 hours"
+        old_allowed["excluded_reason"] = "job is older than 30 hours"
         excluded_pool = pd.concat([excluded_pool, old_allowed], ignore_index=True)
     allowed_pool = allowed_pool[normal_mask].reset_index(drop=True)
     trail.append(f"Jobs after internship/old-job exclusion: {len(allowed_pool)}")
@@ -372,7 +372,7 @@ async def _run_cached_search(
         jobs_store.set_results(
             job_id,
             pd.DataFrame(),
-            message="No strong AI/ML matches from the last 3 days.",
+            message="No strong AI/ML matches from the last 30 hours.",
             low_confidence_df=low_confidence,
         )
         return
@@ -460,7 +460,7 @@ async def _run_cached_search(
         jobs_store.set_results(
             job_id,
             pd.DataFrame(),
-            message="No strong AI/ML matches from the last 3 days.",
+            message="No strong AI/ML matches from the last 30 hours.",
             low_confidence_df=pd.DataFrame(),
         )
         return
@@ -502,7 +502,7 @@ async def _run_cached_search(
 
     n = len(final)
     if n == 0:
-        done_msg = "No strong AI/ML matches from the last 3 days."
+        done_msg = "No strong AI/ML matches from the last 30 hours."
     elif n < result_limit:
         done_msg = f"Found {n} strong AI/ML match{'' if n == 1 else 'es'}. Lower the score filter to see broader roles."
     else:

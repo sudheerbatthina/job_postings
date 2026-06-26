@@ -7,8 +7,8 @@ The legacy score_and_rank() is kept for reference / CLI use.
 """
 
 from __future__ import annotations
-import json
 import logging
+import os
 import re
 import math
 from datetime import date, datetime
@@ -364,7 +364,7 @@ def apply_final_score_rules(df: pd.DataFrame) -> pd.DataFrame:
         if bucket == "old":
             score = min(score, 49)
             excluded = True
-            reason = reason or "job is older than 3 days"
+            reason = reason or "job is older than 30 hours"
         elif bucket == "unknown" and score < 80:
             score = min(score, 64)
             reason = reason or "unknown posting date"
@@ -419,32 +419,23 @@ def fallback_score_row(row, resume_tokens: set[str] | None, window_hours: int) -
 
 
 def sort_scored(df: pd.DataFrame) -> pd.DataFrame:
+    """Sort results by match_band (strong first), then recency (newest first), then ats_score desc."""
     if df.empty:
         return df
     df = df.copy()
     if "posted_age_minutes" not in df.columns:
         df["posted_age_minutes"] = None
-    if "source_type" not in df.columns:
-        df["source_type"] = df.get("source", "")
-    source_priority = {
-        "greenhouse": 1,
-        "lever": 1,
-        "ashby": 1,
-        "workday": 1,
-        "company_portal": 1,
-        "linkedin": 2,
-        "google_jobs": 3,
-        "google": 3,
-        "indeed": 4,
-    }
+    if "match_band" not in df.columns:
+        df["match_band"] = ""
+    _BAND_ORDER = {"strong": 0, "good": 1, "broader": 2, "hidden": 3}
+    df["_band_priority"] = df["match_band"].fillna("").str.lower().map(_BAND_ORDER).fillna(9)
     df["_sort_age"] = pd.to_numeric(df["posted_age_minutes"], errors="coerce")
-    df["_source_priority"] = df["source_type"].fillna("").astype(str).str.lower().map(source_priority).fillna(9)
     df = df.sort_values(
-        ["ats_score", "_sort_age", "_source_priority"],
-        ascending=[False, True, True],
+        ["_band_priority", "_sort_age", "ats_score"],
+        ascending=[True, True, False],
         na_position="last",
     )
-    return df.drop(columns=["_sort_age", "_source_priority"]).reset_index(drop=True)
+    return df.drop(columns=["_band_priority", "_sort_age"]).reset_index(drop=True)
 
 
 def fallback_score_dataframe(
@@ -477,9 +468,15 @@ def claude_score(
     job_title: str = "",
 ) -> dict:
     """Ask Claude Haiku to ATS-score resume↔job fit.
-    Returns {"ats_score": 0-100, "missing_keywords": [...]}; all-zero on any failure."""
+    Returns {"ats_score": 0-100, "missing_keywords": [...]}; all-zero on any failure.
+    Uses the same JSON extraction helpers as resume_parser to handle markdown fences,
+    empty responses, and extra prose without crashing."""
     if client is None:
         return _SCORE_FAILED
+
+    # Shared helpers from resume_parser — handles markdown fences and prose preambles.
+    from .resume_parser import _message_text, _first_json_object
+
     yoe_note = (
         f"The candidate has approximately {total_yoe} year{'s' if total_yoe != 1 else ''} "
         "of professional experience. "
@@ -529,7 +526,14 @@ def claude_score(
                 ),
             }],
         )
-        data = json.loads(msg.content[0].text)
+        raw_text = _message_text(msg)
+        data = _first_json_object(raw_text)
+        if data is None:
+            logger.warning(
+                "claude_score: no JSON object in response; response_len=%s job_title=%r",
+                len(raw_text), (job_title or "")[:80],
+            )
+            return _SCORE_FAILED
         return {
             "ats_score": int(data["ats_score"]),
             "role_relevance": int(data.get("role_relevance", data["ats_score"])),
@@ -541,7 +545,12 @@ def claude_score(
             "confidence": int(data.get("confidence", data.get("role_relevance", data["ats_score"]))),
         }
     except Exception as e:
-        logger.warning("claude_score failed: %s", e)
+        http_status = getattr(e, "status_code", None)
+        api_key_present = bool(os.environ.get("ANTHROPIC_API_KEY"))
+        logger.warning(
+            "claude_score failed: exc_type=%s http_status=%s api_key_present=%s job_title=%r",
+            type(e).__name__, http_status, api_key_present, (job_title or "")[:80],
+        )
         return _SCORE_FAILED
 
 

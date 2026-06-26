@@ -11,7 +11,7 @@ import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
-from app import freshness, main, resume_parser, scraper as scraper_mod
+from app import freshness, main, resume_parser, scoring, scraper as scraper_mod
 from app.sources import ats_sources, google_jobs_serpapi
 
 
@@ -288,8 +288,7 @@ def test_resume_reuse(monkeypatch):
 
 
 def test_timeout_mid_loop_returns_partial_results(monkeypatch):
-    """If the 72h fallback window times out, the job should still complete with
-    whatever results were scored in the first (24h) window."""
+    """Single 30h window (FALLBACK_HOURS=[]) returns results as expected."""
     windows = []
 
     def cached_by_window(hours_old):
@@ -305,8 +304,7 @@ def test_timeout_mid_loop_returns_partial_results(monkeypatch):
 
     resume_bytes = b"Experienced engineer skilled in pytorch, llm, rag, langchain, aws, mlops, embeddings, python, kubernetes."
     files = {"resume": ("resume.txt", resume_bytes, "text/plain")}
-    # hours_old=24 means windows=[24, 72]; first succeeds, second raises TimeoutError
-    data = {"location": "United States", "is_remote": "false", "hours_old": "24"}
+    data = {"location": "United States", "is_remote": "false", "hours_old": "30"}
 
     with TestClient(main.app) as c:
         r = c.post("/api/analyze", files=files, data=data)
@@ -324,8 +322,8 @@ def test_timeout_mid_loop_returns_partial_results(monkeypatch):
     assert body["status"] == "done", f"Expected done, got: {body}"
     assert body["error"] is None
     results = body["results"]
-    assert len(results) >= 1, "Should have results from the cached window"
-    assert windows[:2] == [24, 72]
+    assert len(results) >= 1, "Should have results from the 30h window"
+    assert windows[:1] == [30]
 
 
 def test_yoe_extracted_and_stored(monkeypatch):
@@ -518,14 +516,13 @@ def test_default_search_titles_are_always_included():
     assert "Research Scientist" in analysis["search_titles"]
 
 
-def test_empty_24h_expands_to_72h_only(monkeypatch):
+def test_no_fallback_widening_single_30h_window(monkeypatch):
+    """With FALLBACK_HOURS=[], only the 30h window is queried — no widening if empty."""
     windows = []
 
     def cached_by_window(hours_old):
         windows.append(hours_old)
-        if hours_old < 72:
-            return pd.DataFrame()
-        return _fake_scrape_all("United States", False, hours_old)
+        return pd.DataFrame()  # always empty
 
     _install_cache_fakes(monkeypatch, get_recent_jobs=cached_by_window)
     monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
@@ -537,15 +534,13 @@ def test_empty_24h_expands_to_72h_only(monkeypatch):
         r = c.post(
             "/api/analyze",
             files={"resume": ("resume.txt", b"Python RAG LangChain AWS MLOps", "text/plain")},
-            data={"location": "United States", "is_remote": "false", "hours_old": "24"},
+            data={"location": "United States", "is_remote": "false", "hours_old": "30"},
         )
         assert r.status_code == 200, r.text
         body = _wait_for_done(c, r.json()["job_id"])
 
     assert body["status"] == "done", body
-    assert windows[:2] == [24, 72]
-    assert 168 not in windows
-    assert len(body["results"]) >= 1
+    assert windows == [30], f"Expected only [30], got {windows}"
 
 
 def test_scraper_never_runs_with_empty_search_titles(monkeypatch, tmp_path):
@@ -707,8 +702,8 @@ def test_stale_cache_refreshes_with_broad_stem_titles(monkeypatch, tmp_path):
     result = main.job_cache.refresh_job_cache(force=False, location="United States", is_remote=False)
 
     assert result["status"] == "done"
-    assert result["raw_count"] == 3
-    assert main.job_cache.count_jobs() == 3
+    assert result["raw_count"] == 3  # 3 fetched before prune
+    assert main.job_cache.count_jobs() >= 2  # 5-day-old MLeng job pruned by 30h window
     assert main.job_cache.get_cache_age_minutes() is not None
     assert captured_terms == [main.config.DEFAULT_STEM_SEARCH_TITLES]
 
@@ -1031,6 +1026,74 @@ def test_cache_refresh_not_dominated_by_indeed_when_ats_returns_jobs(monkeypatch
     assert counts["indeed_count"] == 1
     assert counts["greenhouse_count"] + counts["lever_count"] == 2
     assert counts["indeed_count"] < counts["total_cache_jobs"]
+
+
+def test_freshness_sort_strong_newest_first():
+    """Within the same match_band, the most recently posted job must rank first."""
+    now = datetime.now(timezone.utc)
+    df = pd.DataFrame([
+        {
+            "title": "AI Engineer Older",
+            "company": "AcmeA",
+            "location": "Remote",
+            "description": "LLM RAG",
+            "job_url": "http://x/older",
+            "ats_score": 82,
+            "match_band": "strong",
+            "posted_at_ts": (now - timedelta(hours=5)).isoformat(),
+            "posted_age_minutes": 300,
+        },
+        {
+            "title": "AI Engineer Newer",
+            "company": "AcmeB",
+            "location": "Remote",
+            "description": "LLM RAG",
+            "job_url": "http://x/newer",
+            "ats_score": 82,
+            "match_band": "strong",
+            "posted_at_ts": (now - timedelta(minutes=10)).isoformat(),
+            "posted_age_minutes": 10,
+        },
+    ])
+
+    result = scoring.sort_scored(df)
+    assert result.iloc[0]["job_url"] == "http://x/newer", "Newest job should rank first within band"
+    assert result.iloc[1]["job_url"] == "http://x/older"
+
+
+def test_prune_old_jobs_removes_31h_old_jobs(monkeypatch, tmp_path):
+    """A job posted 31h ago must be pruned when MAX_JOB_AGE_HOURS=30."""
+    monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
+    now = datetime.now(timezone.utc)
+    df = pd.DataFrame([
+        {
+            "title": "Fresh AI Engineer",
+            "company": "FreshCo",
+            "location": "Remote",
+            "source": "greenhouse",
+            "source_type": "greenhouse",
+            "job_url": "http://prune31/fresh",
+            "posted_at_ts": (now - timedelta(hours=1)).isoformat(),
+            "description": "LLM RAG",
+        },
+        {
+            "title": "Stale AI Engineer",
+            "company": "StaleCo",
+            "location": "Remote",
+            "source": "greenhouse",
+            "source_type": "greenhouse",
+            "job_url": "http://prune31/stale",
+            "posted_at_ts": (now - timedelta(hours=31)).isoformat(),
+            "description": "LLM RAG",
+        },
+    ])
+
+    main.job_cache.upsert_jobs(df, scraped_at=now.isoformat())
+    pruned = main.job_cache.prune_old_jobs(30)
+    recent = main.job_cache.get_recent_jobs(30)
+
+    assert pruned == 1, f"Expected 1 pruned (31h-old job), got {pruned}"
+    assert set(recent["job_url"]) == {"http://prune31/fresh"}
 
 
 def test_user_run_uses_cached_jobs_instead_of_live_scraper(monkeypatch):
@@ -1639,6 +1702,79 @@ def test_frontend_sends_selected_result_limit():
     assert "useState(10)" in ready_text
     assert "20 jobs" in upload_text
     assert "30 jobs" in ready_text
+
+
+def test_claude_score_empty_response_returns_fallback():
+    """Empty Claude response must not crash — returns _SCORE_FAILED dict."""
+    result = scoring.claude_score(
+        "Build LLM systems with RAG.",
+        "Python RAG LangChain",
+        ["RAG", "LangChain"],
+        3,
+        _ClaudeClient(""),
+    )
+    assert result["ats_score"] is None
+    assert result["missing_keywords"] == []
+    assert result.get("used_fallback_score") is True
+
+
+def test_claude_score_markdown_json_parses_correctly():
+    """Markdown-wrapped JSON in claude_score must be unwrapped and parsed."""
+    raw = """```json
+{"ats_score": 78, "role_relevance": 82, "job_family": "applied_ai_ml",
+ "matched_keywords": ["RAG"], "missing_keywords": ["PyTorch"],
+ "exclude_by_default": false, "exclude_reason": "", "confidence": 80}
+```"""
+    result = scoring.claude_score(
+        "Build LLM RAG systems with PyTorch.",
+        "Python RAG LangChain",
+        ["RAG"],
+        3,
+        _ClaudeClient(raw),
+    )
+    assert result["ats_score"] == 78
+    assert result["missing_keywords"] == ["PyTorch"]
+    assert result.get("used_fallback_score") is not True
+
+
+def test_claude_score_valid_json_returns_real_score():
+    """Valid JSON response returns the correct score and keyword lists."""
+    raw = '{"ats_score": 85, "role_relevance": 90, "job_family": "applied_ai_ml", "matched_keywords": ["LLM", "RAG"], "missing_keywords": ["Kubernetes"], "exclude_by_default": false, "exclude_reason": "", "confidence": 88}'
+    result = scoring.claude_score(
+        "Senior AI Engineer — LLM, RAG, Kubernetes.",
+        "Python LLM RAG LangChain",
+        ["LLM", "RAG"],
+        5,
+        _ClaudeClient(raw),
+    )
+    assert result["ats_score"] == 85
+    assert result["role_relevance"] == 90
+    assert "Kubernetes" in result["missing_keywords"]
+    assert result.get("used_fallback_score") is not True
+
+
+def test_fallback_score_count_surfaces_in_run_message(monkeypatch):
+    """When Claude scoring fails for all jobs, 'fallback scoring used' appears in the done message."""
+    def always_fail_claude(*args, **kwargs):
+        raise RuntimeError("API unavailable")
+
+    _install_cache_fakes(monkeypatch)
+    monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
+    monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
+    monkeypatch.setattr(main.resume_parser, "extract_keywords", lambda text, client: _FAKE_KW)
+    monkeypatch.setattr(main.scoring, "score_with_claude", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("fail")))
+
+    with TestClient(main.app) as c:
+        r = c.post(
+            "/api/analyze",
+            files={"resume": ("resume.txt", b"Python RAG LangChain AWS MLOps", "text/plain")},
+            data={"location": "United States", "is_remote": "false"},
+        )
+        assert r.status_code == 200, r.text
+        body = _wait_for_done(c, r.json()["job_id"])
+
+    assert body["status"] == "done", body
+    assert "fallback scoring used" in body["message"]
 
 
 def test_glassdoor_location_filtering(monkeypatch):

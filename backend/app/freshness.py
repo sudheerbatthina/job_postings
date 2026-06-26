@@ -259,7 +259,7 @@ def normalize_posted_fields(row: dict, reference_time: datetime | None = None) -
     }
 
 
-def is_recent_enough(job, max_age_hours: int = 72) -> bool:
+def is_recent_enough(job, max_age_hours: int = 30) -> bool:
     posted = _as_utc(job.get("posted_at_ts") if hasattr(job, "get") else None)
     if posted is None:
         return True

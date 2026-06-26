@@ -64,7 +64,7 @@ export default function ResultsTable({ results, lowConfidenceResults = [], jobId
   if (results.length === 0 && lowConfidenceResults.length === 0) {
     return (
       <div className="w-full max-w-xl mx-auto text-center py-16">
-        <p className="text-stone-700">No strong AI/ML matches from the last 3 days.</p>
+        <p className="text-stone-700">No strong AI/ML matches from the last 30 hours.</p>
         <p className="mt-1 text-sm text-stone-500">The job boards may not have new postings yet — try again in a few hours.</p>
         <button onClick={onReset} className="mt-6 text-teal-700 font-medium hover:underline">
           Try another search
@@ -136,7 +136,7 @@ export default function ResultsTable({ results, lowConfidenceResults = [], jobId
 
       {results.length === 0 && lowConfidenceResults.length > 0 && !showBroader && (
         <div className="w-full max-w-xl mx-auto text-center py-12">
-          <p className="text-stone-700">No strong AI/ML matches from the last 3 days.</p>
+          <p className="text-stone-700">No strong AI/ML matches from the last 30 hours.</p>
           <p className="mt-1 text-sm text-stone-500">Try lowering the score filter or checking broader matches.</p>
         </div>
       )}
