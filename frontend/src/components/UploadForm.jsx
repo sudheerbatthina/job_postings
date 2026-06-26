@@ -34,11 +34,11 @@ export default function UploadForm({ onSubmit }) {
       </h1>
       <p className="mt-2 text-stone-600">
         Upload your resume. We'll extract your skills, scrape recent job postings across
-        LinkedIn, Indeed, Google, ZipRecruiter, and Glassdoor, then score and rank each
-        match using AI.
+        LinkedIn, Indeed, Google Jobs, Glassdoor, and company ATS sources, then score and
+        rank each match using AI.
       </p>
       <p className="mt-1 text-sm text-stone-400">
-        Searches the last 24 hours, widening to 3 days if needed.
+        Searches Past 24 hours first, widening to Past 3 days if needed.
       </p>
 
       <div

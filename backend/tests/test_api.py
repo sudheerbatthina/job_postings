@@ -36,7 +36,7 @@ def _fake_scrape_all(location, is_remote, hours_old, on_progress=None, search_te
              date_posted=date.today(), is_remote=True, min_amount=180000, max_amount=240000,
              job_url="http://x/1", description="PyTorch, RAG, langchain, fine-tuning, embeddings, mlops, AWS."),
         dict(title="Machine Learning Engineer", company="DataCo", location="NYC",
-             date_posted=date.today() - timedelta(days=5), is_remote=False, min_amount=150000, max_amount=200000,
+             date_posted=date.today() - timedelta(days=2), is_remote=False, min_amount=150000, max_amount=200000,
              job_url="http://x/2", description="TensorFlow, deep learning, computer vision, kubernetes."),
         dict(title="Sales Account Executive", company="SellCorp", location="SF",
              date_posted=date.today(), is_remote=False, min_amount=80000, max_amount=120000,
@@ -142,7 +142,7 @@ def test_health(client):
 def test_full_lifecycle(client):
     resume_text = b"Experienced engineer skilled in pytorch, llm, rag, langchain, aws, mlops, embeddings, python, kubernetes."
     files = {"resume": ("resume.txt", resume_text, "text/plain")}
-    data = {"location": "United States", "is_remote": "false", "hours_old": "168"}
+    data = {"location": "United States", "is_remote": "false", "hours_old": "24"}
 
     r = client.post("/api/analyze", files=files, data=data)
     assert r.status_code == 200, r.text
@@ -196,7 +196,7 @@ def test_results_sorted_by_ats_score(monkeypatch):
 
         resume_text = b"Experienced engineer skilled in pytorch, llm, rag, langchain, aws, mlops, embeddings, python, kubernetes."
         files = {"resume": ("resume.txt", resume_text, "text/plain")}
-        data = {"location": "United States", "is_remote": "false", "hours_old": "168"}
+        data = {"location": "United States", "is_remote": "false", "hours_old": "24"}
 
         r = c.post("/api/analyze", files=files, data=data)
         assert r.status_code == 200, r.text
@@ -255,7 +255,7 @@ def test_resume_reuse(monkeypatch):
 
     resume_bytes = b"Experienced engineer skilled in pytorch, llm, rag, langchain, aws, mlops, embeddings, python, kubernetes."
     files = {"resume": ("resume.txt", resume_bytes, "text/plain")}
-    data = {"location": "United States", "is_remote": "false", "hours_old": "168"}
+    data = {"location": "United States", "is_remote": "false", "hours_old": "24"}
 
     with TestClient(main.app) as c:
         # First upload — should parse + extract
@@ -324,7 +324,7 @@ def test_timeout_mid_loop_returns_partial_results(monkeypatch):
     assert body["error"] is None
     results = body["results"]
     assert len(results) >= 1, "Should have results from the cached window"
-    assert windows[:3] == [24, 72, 168]
+    assert windows[:2] == [24, 72]
 
 
 def test_yoe_extracted_and_stored(monkeypatch):
@@ -517,12 +517,12 @@ def test_default_search_titles_are_always_included():
     assert "Research Scientist" in analysis["search_titles"]
 
 
-def test_empty_24h_expands_to_72h_and_168h(monkeypatch):
+def test_empty_24h_expands_to_72h_only(monkeypatch):
     windows = []
 
     def cached_by_window(hours_old):
         windows.append(hours_old)
-        if hours_old < 168:
+        if hours_old < 72:
             return pd.DataFrame()
         return _fake_scrape_all("United States", False, hours_old)
 
@@ -542,7 +542,8 @@ def test_empty_24h_expands_to_72h_and_168h(monkeypatch):
         body = _wait_for_done(c, r.json()["job_id"])
 
     assert body["status"] == "done", body
-    assert windows[:3] == [24, 72, 168]
+    assert windows[:2] == [24, 72]
+    assert 168 not in windows
     assert len(body["results"]) >= 1
 
 
@@ -600,6 +601,56 @@ def test_job_cache_upserts_and_reads_recent_jobs(monkeypatch, tmp_path):
     assert counts == {"raw_count": 2, "inserted_count": 1, "updated_count": 1}
     assert len(recent) == 2
     assert "Senior AI Engineer" in set(recent["title"])
+
+
+def test_job_cache_excludes_linkedin_easy_apply_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
+    now = datetime.now(timezone.utc).isoformat()
+    df = pd.DataFrame([
+        {
+            "title": "AI Engineer",
+            "company": "LinkedOnly",
+            "location": "Remote",
+            "source": "linkedin",
+            "source_type": "linkedin",
+            "job_url": "https://www.linkedin.com/jobs/view/1",
+            "apply_url": "https://www.linkedin.com/jobs/view/1",
+            "description": "LLM RAG",
+            "date_posted": date.today(),
+            "easy_apply": True,
+        }
+    ])
+
+    main.job_cache.upsert_jobs(df, scraped_at=now)
+    recent = main.job_cache.get_recent_jobs(24)
+
+    assert len(recent) == 1
+    assert bool(recent.iloc[0]["is_linkedin_easy_apply"])
+    assert recent.iloc[0]["excluded_reason"] == "linkedin_easy_apply"
+
+
+def test_linkedin_job_with_external_apply_url_is_kept(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
+    now = datetime.now(timezone.utc).isoformat()
+    df = pd.DataFrame([
+        {
+            "title": "AI Engineer",
+            "company": "DirectLinked",
+            "location": "Remote",
+            "source": "linkedin",
+            "source_type": "linkedin",
+            "job_url": "https://www.linkedin.com/jobs/view/2",
+            "apply_url": "https://directlinked.com/careers/ai-engineer",
+            "description": "LLM RAG",
+            "date_posted": date.today(),
+        }
+    ])
+
+    main.job_cache.upsert_jobs(df, scraped_at=now)
+    recent = main.job_cache.get_recent_jobs(24)
+
+    assert len(recent) == 1
+    assert not bool(recent.iloc[0]["is_linkedin_easy_apply"])
 
 
 def test_stale_cache_refreshes_with_broad_stem_titles(monkeypatch, tmp_path):
@@ -759,6 +810,90 @@ def test_direct_ats_url_wins_over_indeed_duplicate():
     deduped = main.job_cache.dedupe_prefer_sources(df)
     assert len(deduped) == 1
     assert deduped.iloc[0]["source_type"] == "greenhouse"
+
+
+def test_direct_ats_url_wins_over_linkedin_duplicate():
+    df = pd.DataFrame([
+        {
+            "title": "Applied AI Engineer",
+            "company": "Acme",
+            "location": "Remote",
+            "source": "linkedin",
+            "source_type": "linkedin",
+            "job_url": "https://www.linkedin.com/jobs/view/1",
+            "apply_url": "https://www.linkedin.com/jobs/view/1",
+        },
+        {
+            "title": "Applied AI Engineer",
+            "company": "Acme",
+            "location": "Remote",
+            "source": "greenhouse",
+            "source_type": "greenhouse",
+            "job_url": "https://boards.greenhouse.io/acme/jobs/1",
+            "apply_url": "https://boards.greenhouse.io/acme/jobs/1",
+        },
+    ])
+
+    deduped = main.job_cache.dedupe_prefer_sources(df)
+    assert len(deduped) == 1
+    assert deduped.iloc[0]["source_type"] == "greenhouse"
+
+
+def test_job_cache_prunes_jobs_older_than_72h(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
+    now = datetime.now(timezone.utc)
+    df = pd.DataFrame([
+        {
+            "title": "Fresh AI Engineer",
+            "company": "FreshCo",
+            "location": "Remote",
+            "source": "greenhouse",
+            "source_type": "greenhouse",
+            "job_url": "http://prune/fresh",
+            "date_posted": date.today(),
+            "description": "LLM RAG",
+        },
+        {
+            "title": "Old AI Engineer",
+            "company": "OldCo",
+            "location": "Remote",
+            "source": "greenhouse",
+            "source_type": "greenhouse",
+            "job_url": "http://prune/old",
+            "date_posted": date.today() - timedelta(days=4),
+            "description": "LLM RAG",
+        },
+    ])
+
+    main.job_cache.upsert_jobs(df, scraped_at=now.isoformat())
+    pruned = main.job_cache.prune_old_jobs(72)
+    recent = main.job_cache.get_recent_jobs(72)
+
+    assert pruned == 1
+    assert set(recent["job_url"]) == {"http://prune/fresh"}
+
+
+def test_unknown_date_job_older_by_scraped_at_is_pruned(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
+    old_scrape = (datetime.now(timezone.utc) - timedelta(hours=80)).isoformat()
+    df = pd.DataFrame([
+        {
+            "title": "Unknown Date AI Engineer",
+            "company": "OldUnknown",
+            "location": "Remote",
+            "source": "greenhouse",
+            "source_type": "greenhouse",
+            "job_url": "http://prune/unknown",
+            "date_posted": None,
+            "description": "LLM RAG",
+        }
+    ])
+
+    main.job_cache.upsert_jobs(df, scraped_at=old_scrape)
+    pruned = main.job_cache.prune_old_jobs(72)
+
+    assert pruned == 1
+    assert main.job_cache.count_jobs() == 0
 
 
 def test_source_failure_does_not_fail_full_cache_refresh(monkeypatch, tmp_path):
@@ -1170,7 +1305,7 @@ def _run_with_cached_jobs(monkeypatch, jobs: pd.DataFrame, score_map: dict[str, 
         return _wait_for_done(c, r.json()["job_id"])
 
 
-def test_old_jobs_older_than_7_days_excluded_from_main_results(monkeypatch):
+def test_jobs_older_than_72h_excluded_from_main_and_broader_results(monkeypatch):
     jobs = pd.DataFrame([
         {
             "title": "Applied AI Engineer",
@@ -1184,7 +1319,7 @@ def test_old_jobs_older_than_7_days_excluded_from_main_results(monkeypatch):
             "title": "Applied AI Engineer",
             "company": "OldCo",
             "location": "Remote",
-            "date_posted": date.today() - timedelta(days=79),
+            "date_posted": date.today() - timedelta(days=4),
             "job_url": "http://old/ai",
             "description": "Build LLM RAG systems with MLOps.",
         },
@@ -1193,8 +1328,47 @@ def test_old_jobs_older_than_7_days_excluded_from_main_results(monkeypatch):
     body = _run_with_cached_jobs(monkeypatch, jobs)
     assert body["status"] == "done", body
     urls = {row["job_url"] for row in body["results"]}
+    broader_urls = {row["job_url"] for row in body["low_confidence_results"]}
     assert "http://fresh/ai" in urls
     assert "http://old/ai" not in urls
+    assert "http://old/ai" not in broader_urls
+
+
+def test_linkedin_easy_apply_jobs_excluded_from_main_and_broader_results(monkeypatch):
+    jobs = pd.DataFrame([
+        {
+            "title": "Applied AI Engineer",
+            "company": "LinkedOnly",
+            "location": "Remote",
+            "date_posted": date.today(),
+            "job_url": "https://www.linkedin.com/jobs/view/1",
+            "apply_url": "https://www.linkedin.com/jobs/view/1",
+            "source": "linkedin",
+            "source_type": "linkedin",
+            "is_linkedin_easy_apply": True,
+            "description": "Build LLM RAG systems with MLOps.",
+        },
+        {
+            "title": "Applied AI Engineer",
+            "company": "DirectCo",
+            "location": "Remote",
+            "date_posted": date.today(),
+            "job_url": "https://direct.co/jobs/ai",
+            "apply_url": "https://direct.co/jobs/ai",
+            "source": "greenhouse",
+            "source_type": "greenhouse",
+            "is_linkedin_easy_apply": False,
+            "description": "Build LLM RAG systems with MLOps.",
+        },
+    ])
+
+    body = _run_with_cached_jobs(monkeypatch, jobs)
+    urls = {row["job_url"] for row in body["results"]}
+    broader_urls = {row["job_url"] for row in body["low_confidence_results"]}
+    assert "https://direct.co/jobs/ai" in urls
+    assert "https://www.linkedin.com/jobs/view/1" not in urls
+    assert "https://www.linkedin.com/jobs/view/1" not in broader_urls
+    assert "LinkedIn Easy Apply jobs excluded: 1" in body["message"]
 
 
 def test_unknown_date_jobs_need_80_plus_for_main_results(monkeypatch):

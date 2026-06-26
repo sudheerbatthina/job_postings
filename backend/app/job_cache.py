@@ -83,6 +83,8 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
         ("source", "TEXT"),
         ("source_type", "TEXT"),
         ("apply_url", "TEXT"),
+        ("is_linkedin_easy_apply", "INTEGER DEFAULT 0"),
+        ("excluded_reason", "TEXT"),
     ):
         try:
             con.execute(f"ALTER TABLE jobs_cache ADD COLUMN {col} {typedef}")
@@ -145,6 +147,71 @@ def _canonical_url(value) -> str:
         return ""
     parsed = urlparse(str(value))
     return f"{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
+
+
+def _is_linkedin_url(value) -> bool:
+    if not value:
+        return False
+    host = urlparse(str(value)).netloc.lower()
+    return "linkedin.com" in host
+
+
+def _truthy(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _raw_easy_apply_flag(value) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            name = str(key).lower()
+            if name in {"easy_apply", "is_easy_apply"} and _truthy(item):
+                return True
+            if name in {"apply_method", "application_method"} and "easy" in str(item).lower():
+                return True
+            if _raw_easy_apply_flag(item):
+                return True
+    elif isinstance(value, list):
+        return any(_raw_easy_apply_flag(item) for item in value)
+    return False
+
+
+def is_linkedin_easy_apply_job(row) -> bool:
+    source = str(row.get("source_type") or row.get("source") or row.get("site") or "").lower()
+    job_url = row.get("job_url")
+    apply_url = row.get("apply_url")
+    is_linkedin = source == "linkedin" or _is_linkedin_url(job_url) or _is_linkedin_url(apply_url)
+    if not is_linkedin:
+        return False
+    has_external_apply = bool(apply_url) and not _is_linkedin_url(apply_url)
+    if has_external_apply:
+        return False
+    return (
+        _raw_easy_apply_flag(row.to_dict() if hasattr(row, "to_dict") else dict(row))
+        or not apply_url
+        or _is_linkedin_url(apply_url)
+    )
+
+
+def add_linkedin_easy_apply_metadata(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    if "apply_url" not in df.columns:
+        df["apply_url"] = df.get("job_url")
+    flags = [is_linkedin_easy_apply_job(row) for _, row in df.iterrows()]
+    df["is_linkedin_easy_apply"] = flags
+    if "excluded_reason" not in df.columns:
+        df["excluded_reason"] = ""
+    if "exclude_reason" not in df.columns:
+        df["exclude_reason"] = ""
+    mask = pd.Series(flags, index=df.index)
+    df.loc[mask, "excluded_reason"] = "linkedin_easy_apply"
+    df.loc[mask, "exclude_reason"] = "linkedin_easy_apply"
+    return df
 
 
 def _source_priority(row) -> int:
@@ -257,7 +324,7 @@ def upsert_jobs(df: pd.DataFrame, scraped_at: str | None = None) -> dict:
     if df is None or df.empty or "job_url" not in df.columns:
         return {"raw_count": 0, "inserted_count": 0, "updated_count": 0}
 
-    df = dedupe_prefer_sources(df)
+    df = add_linkedin_easy_apply_metadata(dedupe_prefer_sources(df))
     now = scraped_at or _iso_now()
     inserted = 0
     updated = 0
@@ -285,15 +352,18 @@ def upsert_jobs(df: pd.DataFrame, scraped_at: str | None = None) -> dict:
                 _row_value(row, "apply_url") or job_url,
                 now,
                 now,
+                1 if bool(_row_value(row, "is_linkedin_easy_apply")) else 0,
+                _row_value(row, "excluded_reason") or _row_value(row, "exclude_reason"),
                 json.dumps(raw, default=str),
             )
             con.execute(
                 """
                 INSERT INTO jobs_cache (
                     job_url, title, company, location, source, source_type, site,
-                    description, date_posted, apply_url, scraped_at, last_seen_at, raw_json
+                    description, date_posted, apply_url, scraped_at, last_seen_at,
+                    is_linkedin_easy_apply, excluded_reason, raw_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_url) DO UPDATE SET
                     title = excluded.title,
                     company = excluded.company,
@@ -305,6 +375,8 @@ def upsert_jobs(df: pd.DataFrame, scraped_at: str | None = None) -> dict:
                     date_posted = excluded.date_posted,
                     apply_url = excluded.apply_url,
                     last_seen_at = excluded.last_seen_at,
+                    is_linkedin_easy_apply = excluded.is_linkedin_easy_apply,
+                    excluded_reason = excluded.excluded_reason,
                     raw_json = excluded.raw_json
                 """,
                 values,
@@ -322,6 +394,23 @@ def upsert_jobs(df: pd.DataFrame, scraped_at: str | None = None) -> dict:
     }
 
 
+def prune_old_jobs(max_age_hours: int = config.MAX_JOB_AGE_HOURS) -> int:
+    cutoff = datetime.now(timezone.utc) - pd.Timedelta(hours=max_age_hours)
+    with _conn() as con:
+        rows = con.execute("SELECT job_url, date_posted, scraped_at FROM jobs_cache").fetchall()
+        old_urls = []
+        for row in rows:
+            posted = pd.to_datetime(row["date_posted"], errors="coerce", utc=True)
+            scraped = pd.to_datetime(row["scraped_at"], errors="coerce", utc=True)
+            basis = posted if not pd.isna(posted) else scraped
+            if pd.isna(basis) or basis < cutoff:
+                old_urls.append(row["job_url"])
+        if old_urls:
+            con.executemany("DELETE FROM jobs_cache WHERE job_url = ?", [(url,) for url in old_urls])
+            con.commit()
+    return len(old_urls)
+
+
 def refresh_job_cache(
     force: bool = False,
     location: str = "United States",
@@ -331,12 +420,14 @@ def refresh_job_cache(
     search_terms: list[str] | None = None,
 ) -> dict:
     empty_counts = _empty_source_counts()
+    pruned_before = prune_old_jobs(config.MAX_JOB_AGE_HOURS)
     if not force and not is_cache_stale(config.JOB_CACHE_MAX_AGE_MINUTES) and count_jobs() > 0:
         return {
             "status": "skipped",
             "raw_count": 0,
             "inserted_count": 0,
             "updated_count": 0,
+            "pruned_count": pruned_before,
             "source_counts": empty_counts,
             "message": "cache fresh",
         }
@@ -391,7 +482,15 @@ def refresh_job_cache(
         )
         con.commit()
 
-    return {"id": run_id, "status": status, "message": message, "source_counts": source_counts, **counts}
+    pruned_after = prune_old_jobs(config.MAX_JOB_AGE_HOURS)
+    return {
+        "id": run_id,
+        "status": status,
+        "message": message,
+        "source_counts": source_counts,
+        "pruned_count": pruned_before + pruned_after,
+        **counts,
+    }
 
 
 def get_cache_age_minutes() -> float | None:
@@ -439,6 +538,8 @@ def count_jobs() -> int:
 
 
 def get_recent_jobs(hours_old: int) -> pd.DataFrame:
+    hours_old = min(int(hours_old or config.DEFAULT_HOURS_OLD), config.MAX_JOB_AGE_HOURS)
+    prune_old_jobs(config.MAX_JOB_AGE_HOURS)
     with _conn() as con:
         rows = con.execute("SELECT * FROM jobs_cache").fetchall()
     if not rows:

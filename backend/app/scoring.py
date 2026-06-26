@@ -164,10 +164,6 @@ def freshness_for_date(value) -> dict:
         label = f"{days} days ago"
         bucket = "72h"
         freshness = 0.72
-    elif days <= config.MAX_NORMAL_JOB_AGE_DAYS:
-        label = f"{days} days ago"
-        bucket = "7d"
-        freshness = 0.50
     else:
         label = f"{days} days ago"
         bucket = "old"
@@ -225,8 +221,19 @@ def _relevance_result(job_family: str, role_relevance: int, exclude: bool, reaso
     }
 
 
+def _boolish(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
 def classify_job_relevance(job, target_profile: dict | None = None) -> dict:
     """Classify whether a job belongs in the candidate's target role family."""
+    if _boolish(job.get("is_linkedin_easy_apply")):
+        return _relevance_result("other", 0, True, "linkedin_easy_apply")
+
     profile = target_profile or config.DEFAULT_TARGET_PROFILE
     primary_track = profile.get("primary_track", "applied_ai_ml")
     title, _, desc = _text_for_job(job)
@@ -317,6 +324,7 @@ def add_role_relevance(df: pd.DataFrame, target_profile: dict | None = None) -> 
     classifications = [classify_job_relevance(row, target_profile) for _, row in df.iterrows()]
     for key in ("job_family", "role_relevance", "exclude_by_default", "exclude_reason"):
         df[key] = [item[key] for item in classifications]
+    df["excluded_reason"] = df["exclude_reason"]
     return df
 
 
@@ -336,10 +344,14 @@ def apply_final_score_rules(df: pd.DataFrame) -> pd.DataFrame:
         excluded = bool(row.get("exclude_by_default"))
         reason = str(row.get("exclude_reason") or "")
         bucket = row.get("freshness_bucket")
+        if _boolish(row.get("is_linkedin_easy_apply")):
+            score = min(score, 49)
+            excluded = True
+            reason = "linkedin_easy_apply"
         if bucket == "old":
             score = min(score, 49)
             excluded = True
-            reason = reason or "job is older than 7 days"
+            reason = reason or "job is older than 3 days"
         elif bucket == "unknown" and score < 80:
             score = min(score, 64)
             reason = reason or "unknown posting date"
@@ -353,6 +365,7 @@ def apply_final_score_rules(df: pd.DataFrame) -> pd.DataFrame:
     df["ats_score"] = final_scores
     df["exclude_by_default"] = exclude_flags
     df["exclude_reason"] = exclude_reasons
+    df["excluded_reason"] = exclude_reasons
     df["match_band"] = bands
     return df
 
