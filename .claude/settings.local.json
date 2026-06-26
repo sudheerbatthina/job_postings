@@ -4,7 +4,21 @@
       "Bash(pip install *)",
       "Bash(python -c \"from jobspy import scrape_jobs; print\\('ok'\\)\")",
       "Bash(pip check *)",
-      "Bash(python -c \"import ai_engineer_jobs\")"
+      "Bash(python -c \"import ai_engineer_jobs\")",
+      "Bash(python -m venv .venv_verify)",
+      "Bash(.venv_verify/Scripts/pip install *)",
+      "Bash(py -3.11 --version)",
+      "Bash(py -3.12 --version)",
+      "Bash(python -m pytest tests/test_api.py -v)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(git tag *)",
+      "Bash(/c/Users/sudhe/projects/job_postings/.venv/Scripts/pip install *)",
+      "Bash(python -m pytest tests/test_api.py --collect-only)",
+      "Bash(/c/Users/sudhe/AppData/Local/Programs/Python/Python313/python.exe -c \"import jobspy\")",
+      "Bash(/c/Users/sudhe/AppData/Local/Programs/Python/Python313/python.exe -m pytest tests/test_api.py -v --tb=short)",
+      "Bash(/c/Users/sudhe/AppData/Local/Programs/Python/Python313/python.exe -m compileall app/ -q)"
     ]
   }
 }

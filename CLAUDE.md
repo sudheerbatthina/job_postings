@@ -1,3 +1,4 @@
+
 # CLAUDE.md — Job Matcher Codebase Reference
 
 Dense reference for future Claude Code sessions. Everything here is derived from
