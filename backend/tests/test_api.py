@@ -37,7 +37,7 @@ def _fake_scrape_all(location, is_remote, hours_old, on_progress=None, search_te
              date_posted=date.today(), is_remote=True, min_amount=180000, max_amount=240000,
              job_url="http://x/1", description="PyTorch, RAG, langchain, fine-tuning, embeddings, mlops, AWS."),
         dict(title="Machine Learning Engineer", company="DataCo", location="NYC",
-             date_posted=date.today() - timedelta(days=2), is_remote=False, min_amount=150000, max_amount=200000,
+             date_posted=date.today(), is_remote=False, min_amount=150000, max_amount=200000,
              job_url="http://x/2", description="TensorFlow, deep learning, computer vision, kubernetes."),
         dict(title="Sales Account Executive", company="SellCorp", location="SF",
              date_posted=date.today(), is_remote=False, min_amount=80000, max_amount=120000,
@@ -103,6 +103,8 @@ def _install_cache_fakes(monkeypatch, get_recent_jobs=None, count_jobs=3, stale=
         "raw_count": count_jobs,
         "inserted_count": count_jobs,
         "updated_count": 0,
+        "pruned_count": 0,
+        "source_counts": main.job_cache._empty_source_counts(),
         "message": "ok",
     })
     monkeypatch.setattr(main.job_cache, "get_recent_jobs", get_recent_jobs)
@@ -290,7 +292,7 @@ def test_resume_reuse(monkeypatch):
 
 
 def test_timeout_mid_loop_returns_partial_results(monkeypatch):
-    """Single 30h window (FALLBACK_HOURS=[]) returns results as expected."""
+    """The normal flow uses the 30h max window without widening."""
     windows = []
 
     def cached_by_window(hours_old):
@@ -325,7 +327,7 @@ def test_timeout_mid_loop_returns_partial_results(monkeypatch):
     assert body["error"] is None
     results = body["results"]
     assert len(results) >= 1, "Should have results from the 30h window"
-    assert windows[:1] == [30]
+    assert all(window == 30 for window in windows)
 
 
 def test_yoe_extracted_and_stored(monkeypatch):
@@ -519,12 +521,12 @@ def test_default_search_titles_are_always_included():
 
 
 def test_no_fallback_widening_single_30h_window(monkeypatch):
-    """With FALLBACK_HOURS=[], only the 30h window is queried — no widening if empty."""
+    """With FALLBACK_HOURS=[], only the 30h window is queried."""
     windows = []
 
     def cached_by_window(hours_old):
         windows.append(hours_old)
-        return pd.DataFrame()  # always empty
+        return _fake_scrape_all("United States", False, hours_old)
 
     _install_cache_fakes(monkeypatch, get_recent_jobs=cached_by_window)
     monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
@@ -542,7 +544,9 @@ def test_no_fallback_widening_single_30h_window(monkeypatch):
         body = _wait_for_done(c, r.json()["job_id"])
 
     assert body["status"] == "done", body
-    assert windows == [30], f"Expected only [30], got {windows}"
+    assert all(window == 30 for window in windows)
+    assert 72 not in windows
+    assert len(body["results"]) >= 1
 
 
 def test_scraper_never_runs_with_empty_search_titles(monkeypatch, tmp_path):
@@ -707,7 +711,7 @@ def test_stale_cache_refreshes_with_broad_stem_titles(monkeypatch, tmp_path):
 
     assert result["status"] == "done"
     assert result["raw_count"] == 3  # 3 fetched before prune
-    assert main.job_cache.count_jobs() >= 2  # 5-day-old MLeng job pruned by 30h window
+    assert main.job_cache.count_jobs() >= 2
     assert main.job_cache.get_cache_age_minutes() is not None
     assert captured_terms == [main.config.DEFAULT_STEM_SEARCH_TITLES]
 
@@ -850,10 +854,54 @@ def test_source_counts_are_stored_on_cache_refresh(monkeypatch, tmp_path):
     assert counts["linkedin_count"] == 1
     assert counts["indeed_count"] == 1
     assert counts["google_jobs_count"] == 1
+    assert counts["serpapi_google_jobs_count"] == 1
+    assert counts["jobspy_linkedin_count"] == 1
+    assert counts["jobspy_indeed_count"] == 1
     assert counts["greenhouse_count"] == 1
     assert counts["lever_count"] == 1
     assert counts["total_cache_jobs"] == 5
     assert main.job_cache.get_latest_source_counts()["greenhouse_count"] == 1
+
+
+def test_cache_debug_endpoint_returns_counts(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
+    now = datetime.now(timezone.utc).isoformat()
+    df = pd.DataFrame([
+        {
+            "title": "AI Engineer",
+            "company": "AdzunaCo",
+            "location": "Remote",
+            "source": "adzuna",
+            "source_type": "adzuna",
+            "job_url": "http://adzuna/debug",
+            "date_posted": date.today(),
+            "description": "LLM RAG",
+        },
+        {
+            "title": "Applied AI Engineer",
+            "company": "GreenCo",
+            "location": "Remote",
+            "source": "greenhouse",
+            "source_type": "greenhouse",
+            "job_url": "http://greenhouse/debug",
+            "date_posted": date.today(),
+            "description": "LLM RAG",
+        },
+    ])
+    main.job_cache.upsert_jobs(df, scraped_at=now)
+
+    with TestClient(main.app) as c:
+        r = c.get("/api/cache/debug")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_jobs"] == 2
+    assert body["jobs_by_source"]["adzuna_count"] == 1
+    assert body["jobs_by_source"]["greenhouse_count"] == 1
+    assert body["config"]["MAX_JOB_AGE_HOURS"] == 30
+    assert body["config"]["DEFAULT_RESULT_LIMIT"] == 10
+    assert body["config"]["CANDIDATE_POOL_LIMIT"] == main.config.CANDIDATE_POOL_LIMIT
+    assert body["config"]["ENABLE_SEEN_FILTER"] is False
 
 
 def test_direct_ats_url_wins_over_indeed_duplicate():
@@ -910,7 +958,7 @@ def test_direct_ats_url_wins_over_linkedin_duplicate():
     assert deduped.iloc[0]["source_type"] == "greenhouse"
 
 
-def test_job_cache_prunes_jobs_older_than_72h(monkeypatch, tmp_path):
+def test_job_cache_prunes_jobs_older_than_30h(monkeypatch, tmp_path):
     monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
     now = datetime.now(timezone.utc)
     df = pd.DataFrame([
@@ -937,8 +985,8 @@ def test_job_cache_prunes_jobs_older_than_72h(monkeypatch, tmp_path):
     ])
 
     main.job_cache.upsert_jobs(df, scraped_at=now.isoformat())
-    pruned = main.job_cache.prune_old_jobs(72)
-    recent = main.job_cache.get_recent_jobs(72)
+    pruned = main.job_cache.prune_old_jobs(30)
+    recent = main.job_cache.get_recent_jobs(30)
 
     assert pruned == 1
     assert set(recent["job_url"]) == {"http://prune/fresh"}
@@ -965,6 +1013,62 @@ def test_unknown_date_job_older_by_scraped_at_is_pruned(monkeypatch, tmp_path):
 
     assert pruned == 1
     assert main.job_cache.count_jobs() == 0
+
+
+def test_30h_filter_keeps_recent_timezone_aware_and_naive_jobs(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
+    now = datetime.now(timezone.utc)
+    naive_recent = (datetime.now() - timedelta(hours=3)).replace(microsecond=0).isoformat()
+    aware_recent = (now - timedelta(hours=2)).isoformat()
+    df = pd.DataFrame([
+        {
+            "title": "Aware AI Engineer",
+            "company": "AwareCo",
+            "location": "Remote",
+            "source": "greenhouse",
+            "source_type": "greenhouse",
+            "job_url": "http://tz/aware",
+            "posted_at_ts": aware_recent,
+            "description": "LLM RAG",
+        },
+        {
+            "title": "Naive AI Engineer",
+            "company": "NaiveCo",
+            "location": "Remote",
+            "source": "lever",
+            "source_type": "lever",
+            "job_url": "http://tz/naive",
+            "posted_at_ts": naive_recent,
+            "description": "LLM RAG",
+        },
+    ])
+
+    main.job_cache.upsert_jobs(df, scraped_at=now.isoformat())
+    recent = main.job_cache.get_recent_jobs(30)
+
+    assert set(recent["job_url"]) == {"http://tz/aware", "http://tz/naive"}
+
+
+def test_30h_filter_excludes_truly_old_timezone_aware_job(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
+    now = datetime.now(timezone.utc)
+    df = pd.DataFrame([
+        {
+            "title": "Old AI Engineer",
+            "company": "OldCo",
+            "location": "Remote",
+            "source": "greenhouse",
+            "source_type": "greenhouse",
+            "job_url": "http://tz/old",
+            "posted_at_ts": (now - timedelta(hours=31)).isoformat(),
+            "description": "LLM RAG",
+        }
+    ])
+
+    main.job_cache.upsert_jobs(df, scraped_at=now.isoformat())
+    recent = main.job_cache.get_recent_jobs(30)
+
+    assert recent.empty
 
 
 def test_source_failure_does_not_fail_full_cache_refresh(monkeypatch, tmp_path):
@@ -1070,7 +1174,7 @@ def test_freshness_sort_strong_newest_first():
 
 
 def test_prune_old_jobs_removes_31h_old_jobs(monkeypatch, tmp_path):
-    """A job posted 31h ago must be pruned when MAX_JOB_AGE_HOURS=30."""
+    """A job posted more than 30h ago must be pruned."""
     monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
     now = datetime.now(timezone.utc)
     df = pd.DataFrame([
@@ -1422,7 +1526,12 @@ def test_seen_logic_disabled_does_not_mark_displayed_jobs(monkeypatch):
     assert "Seen filter disabled" in body["message"]
 
 
-def _run_with_cached_jobs(monkeypatch, jobs: pd.DataFrame, score_map: dict[str, int] | None = None):
+def _run_with_cached_jobs(
+    monkeypatch,
+    jobs: pd.DataFrame,
+    score_map: dict[str, int] | None = None,
+    data: dict | None = None,
+):
     def score_jobs(df, resume_text, skill_signals, total_yoe, client, *args):
         df = df.copy()
         scores = score_map or {}
@@ -1436,11 +1545,13 @@ def _run_with_cached_jobs(monkeypatch, jobs: pd.DataFrame, score_map: dict[str, 
     monkeypatch.setattr(main.resume_parser, "extract_keywords", lambda text, client: _FAKE_KW)
     monkeypatch.setattr(main.scoring, "score_with_claude", score_jobs)
 
+    payload = {"location": "United States", "is_remote": "false", "hours_old": "24"}
+    payload.update(data or {})
     with TestClient(main.app) as c:
         r = c.post(
             "/api/analyze",
             files={"resume": ("resume.txt", b"Applied AI LLM RAG MLOps Python", "text/plain")},
-            data={"location": "United States", "is_remote": "false", "hours_old": "24"},
+            data=payload,
         )
         assert r.status_code == 200, r.text
         return _wait_for_done(c, r.json()["job_id"])
@@ -1514,13 +1625,96 @@ def test_result_limit_30_returns_at_most_30(monkeypatch):
     assert "Result limit: 30" in body["message"]
 
 
-def test_jobs_older_than_72h_excluded_from_main_and_broader_results(monkeypatch):
+def test_low_30h_cache_count_forces_refresh_and_reports_source_counts(monkeypatch):
+    jobs = _many_good_jobs(20)
+    refresh_calls = []
+    counts = main.job_cache._empty_source_counts()
+    counts.update({
+        "adzuna_count": 11,
+        "arbeitnow_count": 7,
+        "serpapi_google_jobs_count": 5,
+        "jobspy_linkedin_count": 3,
+        "jobspy_google_count": 2,
+        "jobspy_indeed_count": 4,
+        "greenhouse_count": 6,
+        "lever_count": 1,
+        "ashby_count": 1,
+        "total_cache_jobs": 40,
+    })
+
+    def fake_refresh(*args, **kwargs):
+        refresh_calls.append((args, kwargs))
+        return {
+            "status": "done",
+            "raw_count": 40,
+            "inserted_count": 20,
+            "updated_count": 20,
+            "pruned_count": 0,
+            "source_counts": counts,
+            "message": "ok",
+        }
+
+    _install_cache_fakes(monkeypatch, get_recent_jobs=lambda hours_old: jobs, count_jobs=len(jobs))
+    monkeypatch.setattr(main.job_cache, "refresh_job_cache", fake_refresh)
+    monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
+    monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
+    monkeypatch.setattr(main.resume_parser, "extract_keywords", lambda text, client: _FAKE_KW)
+    monkeypatch.setattr(main.scoring, "score_with_claude", _fake_score_with_claude)
+
+    with TestClient(main.app) as c:
+        r = c.post(
+            "/api/analyze",
+            files={"resume": ("resume.txt", b"Applied AI LLM RAG MLOps Python", "text/plain")},
+            data={"location": "United States", "is_remote": "false", "hours_old": "24"},
+        )
+        assert r.status_code == 200, r.text
+        body = _wait_for_done(c, r.json()["job_id"])
+
+    assert refresh_calls
+    assert "Cached jobs within 30h before refresh: 20" in body["message"]
+    assert "Cache refreshed: True" in body["message"]
+    assert "Adzuna raw count: 11" in body["message"]
+    assert "Arbeitnow raw count: 7" in body["message"]
+    assert "SerpAPI Google Jobs raw count: 5" in body["message"]
+    assert "JobSpy LinkedIn raw count: 3" in body["message"]
+    assert "Jobs sent to Claude scoring:" in body["message"]
+
+
+def test_result_limit_does_not_limit_scoring_candidate_pool(monkeypatch):
+    jobs = _many_good_jobs(250)
+    scored_lengths = []
+
+    def capture_score(df, resume_text, skill_signals, total_yoe, client, *args):
+        scored_lengths.append(len(df))
+        return _fake_score_with_claude(df, resume_text, skill_signals, total_yoe, client, *args)
+
+    _install_cache_fakes(monkeypatch, get_recent_jobs=lambda hours_old: jobs, count_jobs=len(jobs))
+    monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
+    monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
+    monkeypatch.setattr(main.resume_parser, "extract_keywords", lambda text, client: _FAKE_KW)
+    monkeypatch.setattr(main.scoring, "score_with_claude", capture_score)
+
+    with TestClient(main.app) as c:
+        r = c.post(
+            "/api/analyze",
+            files={"resume": ("resume.txt", b"Applied AI LLM RAG MLOps Python", "text/plain")},
+            data={"location": "United States", "is_remote": "false", "result_limit": "10"},
+        )
+        assert r.status_code == 200, r.text
+        body = _wait_for_done(c, r.json()["job_id"])
+
+    assert body["status"] == "done", body
+    assert len(body["results"]) == 10
+    assert scored_lengths == [main.config.CANDIDATE_POOL_LIMIT]
+
+
+def test_jobs_older_than_30h_excluded_from_main_and_broader_results(monkeypatch):
     jobs = pd.DataFrame([
         {
             "title": "Applied AI Engineer",
             "company": "FreshCo",
             "location": "Remote",
-            "date_posted": date.today(),
+            "posted_at_ts": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
             "job_url": "http://fresh/ai",
             "description": "Build LLM RAG systems with MLOps.",
         },
@@ -1528,7 +1722,7 @@ def test_jobs_older_than_72h_excluded_from_main_and_broader_results(monkeypatch)
             "title": "Applied AI Engineer",
             "company": "OldCo",
             "location": "Remote",
-            "date_posted": date.today() - timedelta(days=4),
+            "posted_at_ts": (datetime.now(timezone.utc) - timedelta(hours=31)).isoformat(),
             "job_url": "http://old/ai",
             "description": "Build LLM RAG systems with MLOps.",
         },
@@ -1994,6 +2188,56 @@ def test_adzuna_fetch_skips_gracefully_when_keys_missing(monkeypatch):
     monkeypatch.delenv("ADZUNA_APP_KEY", raising=False)
     df = fetch_adzuna_jobs()
     assert df.empty
+
+
+def test_adzuna_fetch_paginates_and_aggregates(monkeypatch):
+    from app.sources import adzuna
+
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, page):
+            self.page = page
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            term_slug = str(calls[-1][1]["what"]).lower().replace(" ", "-")
+            return {
+                "results": [
+                    {
+                        "title": f"AI Engineer {term_slug} page {self.page}",
+                        "description": "Build LLM RAG systems with embeddings.",
+                        "company": {"display_name": f"AI Co {self.page}"},
+                        "location": {"display_name": "Remote, US"},
+                        "redirect_url": f"https://adzuna.example/jobs/{term_slug}-{self.page}",
+                        "created": "2026-06-26T12:00:00Z",
+                    }
+                ]
+            }
+
+    def fake_get(url, params, timeout):
+        calls.append((url, params.copy(), timeout))
+        page = int(url.rsplit("/", 1)[-1])
+        return FakeResponse(page)
+
+    monkeypatch.setenv("ADZUNA_APP_ID", "id")
+    monkeypatch.setenv("ADZUNA_APP_KEY", "key")
+    monkeypatch.setattr(adzuna.config, "ADZUNA_SEARCH_TITLES", ["AI Engineer", "ML Engineer"])
+    monkeypatch.setattr(adzuna.config, "ADZUNA_PAGES_PER_QUERY", 2)
+    monkeypatch.setattr(adzuna.config, "ADZUNA_RESULTS_PER_PAGE", 50)
+    monkeypatch.setattr(adzuna.requests, "get", fake_get)
+
+    df = adzuna.fetch_adzuna_jobs(search_terms=["AI Engineer"], country="us", timeout=3)
+
+    assert len(df) == 4
+    assert [call[0].rsplit("/", 1)[-1] for call in calls] == ["1", "2", "1", "2"]
+    assert [call[1]["what"] for call in calls] == ["AI Engineer", "AI Engineer", "ML Engineer", "ML Engineer"]
+    assert all(call[1]["results_per_page"] == 50 for call in calls)
+    assert all("/us/search/" in call[0] for call in calls)
 
 
 # ---------------------------------------------------------------------------

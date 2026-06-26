@@ -136,6 +136,11 @@ def get_status(job_id: str):
     }
 
 
+@app.get("/api/cache/debug")
+def cache_debug():
+    return job_cache.get_cache_debug()
+
+
 @app.get("/api/analyze/{job_id}/export.xlsx")
 def export_xlsx(job_id: str):
     job = jobs_store.get_job(job_id)
@@ -221,7 +226,27 @@ def _recent_shortlist(df: pd.DataFrame, limit: int) -> pd.DataFrame:
 
 
 def _update_trail(job_id: str, trail: list[str]) -> None:
+    if trail:
+        logger.info("job_id=%s %s", job_id, trail[-1])
     jobs_store.update_job(job_id, message=" → ".join(trail))
+
+
+def _message_with_trail(summary: str, trail: list[str]) -> str:
+    return summary + (" | " + " → ".join(trail) if trail else "")
+
+
+def _source_count_lines(counts: dict) -> list[str]:
+    return [
+        f"Adzuna raw count: {counts.get('adzuna_count', 0)}",
+        f"Arbeitnow raw count: {counts.get('arbeitnow_count', 0)}",
+        f"SerpAPI Google Jobs raw count: {counts.get('serpapi_google_jobs_count', 0)}",
+        f"JobSpy LinkedIn raw count: {counts.get('jobspy_linkedin_count', 0)}",
+        f"JobSpy Google raw count: {counts.get('jobspy_google_count', 0)}",
+        f"Indeed raw count: {counts.get('jobspy_indeed_count', 0)}",
+        f"Greenhouse count: {counts.get('greenhouse_count', 0)}",
+        f"Lever count: {counts.get('lever_count', 0)}",
+        f"Ashby count: {counts.get('ashby_count', 0)}",
+    ]
 
 
 def _fetch_jobposting_date(url: str) -> str | None:
@@ -303,21 +328,28 @@ async def _run_cached_search(
     pruned_count = await asyncio.to_thread(job_cache.prune_old_jobs, config.MAX_JOB_AGE_HOURS)
     cache_age = await asyncio.to_thread(job_cache.get_cache_age_minutes)
     cache_count = await asyncio.to_thread(job_cache.count_jobs)
+    cache_30h_df = await asyncio.to_thread(job_cache.get_recent_jobs, config.MAX_JOB_AGE_HOURS)
+    cache_30h_count = len(cache_30h_df)
     source_counts = await asyncio.to_thread(job_cache.get_latest_source_counts)
     age_label = "unknown" if cache_age is None else f"{cache_age:.1f}m"
-    trail.append(f"Job cache age: {age_label}; cached jobs: {cache_count}")
+    trail.append(f"Job cache age: {age_label}; cached jobs before refresh: {cache_count}")
+    trail.append(f"Cached jobs within 30h before refresh: {cache_30h_count}")
     trail.append(f"Result limit: {result_limit}")
     trail.append(f"Max job age: {config.MAX_JOB_AGE_HOURS}h")
     trail.append(f"Cache jobs pruned: {pruned_count}")
     trail.append(job_cache.format_source_counts(source_counts))
+    trail.extend(_source_count_lines(source_counts))
     if not config.ENABLE_SEEN_FILTER:
         trail.append("Seen filter disabled")
     _update_trail(job_id, trail)
 
     cache_stale = await asyncio.to_thread(
-        job_cache.is_cache_stale, config.JOB_CACHE_MAX_AGE_MINUTES
+        job_cache.is_cache_stale, config.CACHE_MAX_AGE_MINUTES
     )
-    if cache_count == 0 or cache_stale:
+    cache_too_small = cache_30h_count < config.MIN_CACHE_JOBS_30H
+    should_refresh = cache_count == 0 or cache_stale or cache_too_small
+    trail.append(f"Cache refreshed: {should_refresh}")
+    if should_refresh:
         cache_refreshed = True
         trail.append("Refreshing job cache...")
         _update_trail(job_id, trail)
@@ -334,6 +366,9 @@ async def _run_cached_search(
             f"pruned {refresh.get('pruned_count', 0)}"
         )
         trail.append(job_cache.format_source_counts(refresh.get("source_counts", {})))
+        trail.extend(_source_count_lines(refresh.get("source_counts", {})))
+        cache_count_after = await asyncio.to_thread(job_cache.count_jobs)
+        trail.append(f"Cached jobs after refresh: {cache_count_after}")
         _update_trail(job_id, trail)
 
     raw_df = pd.DataFrame()
@@ -344,19 +379,18 @@ async def _run_cached_search(
         _update_trail(job_id, trail)
         raw_df = candidate_df
         selected_window = window
-        if len(candidate_df) >= result_limit:
-            break
 
     if raw_df.empty:
         jobs_store.set_results(
             job_id,
             pd.DataFrame(),
-            message="No strong AI/ML matches from the last 30 hours.",
+            message=_message_with_trail("No strong AI/ML matches from the last 30 hours.", trail),
             low_confidence_df=pd.DataFrame(),
         )
         return
 
     raw_df = await asyncio.to_thread(scoring.dedupe_display_jobs, raw_df)
+    trail.append(f"Jobs after excluded-title filters: {len(raw_df)}")
     relevant_pool = await asyncio.to_thread(scoring.add_role_relevance, raw_df, target_profile)
     allowed_count = int((~relevant_pool["exclude_by_default"].fillna(True)).sum())
     easy_apply_count = (
@@ -364,7 +398,7 @@ async def _run_cached_search(
         if "is_linkedin_easy_apply" in relevant_pool.columns else 0
     )
     trail.append(f"LinkedIn Easy Apply jobs excluded: {easy_apply_count}")
-    trail.append(f"Jobs after role filter: {allowed_count}")
+    trail.append(f"Jobs after role relevance gate: {allowed_count}")
     _update_trail(job_id, trail)
 
     if allowed_count < result_limit:
@@ -387,6 +421,7 @@ async def _run_cached_search(
             f"pruned {refresh.get('pruned_count', 0)}"
         )
         trail.append(job_cache.format_source_counts(refresh.get("source_counts", {})))
+        trail.extend(_source_count_lines(refresh.get("source_counts", {})))
         _update_trail(job_id, trail)
         refreshed_df = await asyncio.to_thread(job_cache.get_recent_jobs, selected_window)
         if not refreshed_df.empty:
@@ -403,7 +438,7 @@ async def _run_cached_search(
 
     excluded_pool = relevant_pool[relevant_pool["exclude_by_default"].fillna(True)].copy()
     allowed_pool = relevant_pool[~relevant_pool["exclude_by_default"].fillna(True)].reset_index(drop=True)
-    normal_mask = allowed_pool["freshness_bucket"].isin(["24h", "72h", "unknown"])
+    normal_mask = allowed_pool["freshness_bucket"].isin(["24h", "30h", "unknown"])
     old_allowed = allowed_pool[~normal_mask].copy()
     if not old_allowed.empty:
         old_allowed["exclude_by_default"] = True
@@ -424,7 +459,7 @@ async def _run_cached_search(
         jobs_store.set_results(
             job_id,
             pd.DataFrame(),
-            message="No strong AI/ML matches from the last 30 hours.",
+            message=_message_with_trail("No strong AI/ML matches from the last 30 hours.", trail),
             low_confidence_df=low_confidence,
         )
         return
@@ -444,7 +479,7 @@ async def _run_cached_search(
             candidate_df = unseen_df
             trail.append("Seen-fill jobs: 0")
     else:
-        candidate_df = allowed_pool.copy()
+        candidate_df = scoring.sort_unscored_recent(allowed_pool.copy()).head(config.CANDIDATE_POOL_LIMIT)
         candidate_df["seen_before"] = False
         trail.append(f"Seen filter disabled; candidates unchanged: {len(candidate_df)}")
     _update_trail(job_id, trail)
@@ -470,6 +505,9 @@ async def _run_cached_search(
         used_prefilter_bypass = True
         trail.append(f"Showing best recent matches from cached jobs: {len(filtered)}")
         _update_trail(job_id, trail)
+
+    trail.append(f"Jobs sent to Claude scoring: {len(filtered)}")
+    _update_trail(job_id, trail)
 
     try:
         scored = await asyncio.wait_for(
@@ -515,7 +553,7 @@ async def _run_cached_search(
         jobs_store.set_results(
             job_id,
             pd.DataFrame(),
-            message="No strong AI/ML matches from the last 30 hours.",
+            message=_message_with_trail("No strong AI/ML matches from the last 30 hours.", trail),
             low_confidence_df=pd.DataFrame(),
         )
         return
@@ -538,7 +576,8 @@ async def _run_cached_search(
     final.insert(0, "rank", range(1, len(final) + 1))
     if not low_confidence.empty:
         low_confidence.insert(0, "rank", range(1, len(low_confidence) + 1))
-    trail.append(f"Final strong/good matches: {len(final)}")
+    trail.append(f"Strong/good count: {len(strong)}")
+    trail.append(f"Final returned count: {len(final)}")
     trail.append(f"Broader matches: {len(low_confidence)}")
     _update_trail(job_id, trail)
 

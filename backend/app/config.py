@@ -14,11 +14,14 @@ ENRICHMENT_TOP_N = 20   # max jobs to fetch pages for JSON-LD posted-time enrich
 
 RESULTS_WANTED_PER_TERM = 25
 DEFAULT_HOURS_OLD = 30
-FALLBACK_HOURS = []     # no fallback widening — 30h is the hard window
+FALLBACK_HOURS = []     # no fallback widening - 30h is the hard window
 RESUME_ANALYSIS_VERSION = 3
-PREFILTER_BYPASS_LIMIT = 25
+CANDIDATE_POOL_LIMIT = 200
+PREFILTER_BYPASS_LIMIT = 200
 JOB_CACHE_MAX_AGE_MINUTES = 60
+CACHE_MAX_AGE_MINUTES = 60
 JOB_CACHE_REFRESH_HOURS = 30
+MIN_CACHE_JOBS_30H = 100
 MIN_RAW_JOBS_FOR_RESULTS = 20
 SEEN_TTL_HOURS = 24
 DEFAULT_MIN_ATS_SCORE = 65
@@ -28,6 +31,21 @@ BROADER_MIN_ATS_SCORE = 50
 DEFAULT_RESULT_LIMIT = 10
 ALLOWED_RESULT_LIMITS = [10, 20, 30]
 MAX_RESULT_LIMIT = 30
+ADZUNA_PAGES_PER_QUERY = 3
+ADZUNA_RESULTS_PER_PAGE = 50
+ADZUNA_SEARCH_TITLES = [
+    "AI Engineer",
+    "Applied AI Engineer",
+    "Machine Learning Engineer",
+    "ML Engineer",
+    "GenAI Engineer",
+    "LLM Engineer",
+    "RAG Engineer",
+    "MLOps Engineer",
+    "AI Platform Engineer",
+    "Applied Scientist",
+    "Python AI Engineer",
+]
 
 DEFAULT_SEARCH_TITLES = [
     "AI Engineer",

@@ -74,7 +74,7 @@ def title_blocked(title: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def prefilter(df: pd.DataFrame, resume_tokens: set[str]) -> pd.DataFrame:
-    """Keep rows with token overlap >= 0.15; return at most 50 sorted by recency."""
+    """Keep rows with token overlap >= 0.15; return a larger sorted candidate pool."""
     if df.empty:
         return df
     df = df.copy()
@@ -92,7 +92,7 @@ def prefilter(df: pd.DataFrame, resume_tokens: set[str]) -> pd.DataFrame:
     if "date_posted" not in df.columns:
         df["date_posted"] = None
 
-    df = df.sort_values("date_posted", ascending=False, na_position="last").head(50)
+    df = sort_unscored_recent(df).head(config.CANDIDATE_POOL_LIMIT)
     return df.reset_index(drop=True)
 
 
@@ -158,12 +158,8 @@ def freshness_for_date(value) -> dict:
         freshness = 1.0
     elif days == 1:
         label = "Posted yesterday"
-        bucket = "72h"
+        bucket = "30h"
         freshness = 0.85
-    elif days <= 3:
-        label = f"Posted {days} days ago"
-        bucket = "72h"
-        freshness = 0.72
     else:
         label = f"Posted {days} days ago"
         bucket = "old"
@@ -185,7 +181,7 @@ def add_freshness_metadata(df: pd.DataFrame) -> pd.DataFrame:
         if row.get("posted_at_ts") is not None or row.get("posted_at_raw") is not None or row.get("date_posted") is not None:
             meta = freshness.normalize_posted_fields(row.to_dict())
             bucket = meta["freshness_bucket"]
-            freshness_score = 1.0 if bucket == "24h" else 0.72 if bucket == "72h" else 0.10 if bucket == "old" else 0.25
+            freshness_score = 1.0 if bucket == "24h" else 0.72 if bucket == "30h" else 0.10 if bucket == "old" else 0.25
             age_days = None if meta["posted_age_minutes"] is None else int(meta["posted_age_minutes"] // 1440)
             meta["posted_age_days"] = age_days
             meta["freshness_score"] = freshness_score
@@ -418,24 +414,72 @@ def fallback_score_row(row, resume_tokens: set[str] | None, window_hours: int) -
     return max(0, min(100, int(round(score))))
 
 
-def sort_scored(df: pd.DataFrame) -> pd.DataFrame:
-    """Sort results by match_band (strong first), then recency (newest first), then ats_score desc."""
-    if df.empty:
-        return df
+_SOURCE_PRIORITY = {
+    "greenhouse": 1,
+    "lever": 1,
+    "ashby": 1,
+    "workday": 1,
+    "company_portal": 1,
+    "linkedin": 2,
+    "google_jobs": 3,
+    "google": 3,
+    "indeed": 4,
+    "arbeitnow": 4,
+    "adzuna": 4,
+}
+
+
+def _with_sort_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     if "posted_age_minutes" not in df.columns:
         df["posted_age_minutes"] = None
+    if "posted_at_ts" not in df.columns:
+        df["posted_at_ts"] = None
+    if "source_type" not in df.columns:
+        df["source_type"] = df.get("source", "")
     if "match_band" not in df.columns:
         df["match_band"] = ""
-    _BAND_ORDER = {"strong": 0, "good": 1, "broader": 2, "hidden": 3}
-    df["_band_priority"] = df["match_band"].fillna("").str.lower().map(_BAND_ORDER).fillna(9)
+    if "ats_score" not in df.columns:
+        df["ats_score"] = 0
+    band_order = {"strong": 0, "good": 1, "broader": 2, "hidden": 3}
+    df["_band_priority"] = df["match_band"].fillna("").astype(str).str.lower().map(band_order).fillna(9)
     df["_sort_age"] = pd.to_numeric(df["posted_age_minutes"], errors="coerce")
+    df["_sort_posted"] = pd.to_datetime(df["posted_at_ts"], errors="coerce", utc=True)
+    df["_source_priority"] = (
+        df["source_type"].fillna("").astype(str).str.lower().map(_SOURCE_PRIORITY).fillna(9)
+    )
+    return df
+
+
+def sort_unscored_recent(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = _with_sort_columns(df)
     df = df.sort_values(
-        ["_band_priority", "_sort_age", "ats_score"],
-        ascending=[True, True, False],
+        ["_sort_age", "_source_priority"],
+        ascending=[True, True],
         na_position="last",
     )
-    return df.drop(columns=["_band_priority", "_sort_age"]).reset_index(drop=True)
+    return df.drop(
+        columns=["_band_priority", "_sort_age", "_sort_posted", "_source_priority"],
+        errors="ignore",
+    ).reset_index(drop=True)
+
+
+def sort_scored(df: pd.DataFrame) -> pd.DataFrame:
+    """Default recommended ranking for scored jobs."""
+    if df.empty:
+        return df
+    df = _with_sort_columns(df)
+    df = df.sort_values(
+        ["_band_priority", "ats_score", "_sort_age", "_source_priority"],
+        ascending=[True, False, True, True],
+        na_position="last",
+    )
+    return df.drop(
+        columns=["_band_priority", "_sort_age", "_sort_posted", "_source_priority"],
+        errors="ignore",
+    ).reset_index(drop=True)
 
 
 def fallback_score_dataframe(

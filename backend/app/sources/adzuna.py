@@ -7,6 +7,7 @@ API docs: https://developer.adzuna.com/
 from __future__ import annotations
 
 import os
+import logging
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -15,6 +16,7 @@ import requests
 from .. import config, freshness
 
 _API_BASE = "https://api.adzuna.com/v1/api/jobs"
+logger = logging.getLogger(__name__)
 
 _AI_TERMS = [
     "machine learning", "ml engineer", "ai engineer", "llm", "large language model",
@@ -85,34 +87,53 @@ def fetch_adzuna_jobs(
 ) -> pd.DataFrame:
     app_id = os.environ.get("ADZUNA_APP_ID")
     app_key = os.environ.get("ADZUNA_APP_KEY")
+    logger.info(
+        "adzuna credentials present: app_id=%s app_key=%s",
+        bool(app_id),
+        bool(app_key),
+    )
     if not app_id or not app_key:
+        logger.info("adzuna skipped: missing credentials")
         return pd.DataFrame()
 
-    terms = (search_terms or config.DEFAULT_STEM_SEARCH_TITLES)[:5]
+    terms = list(dict.fromkeys(config.ADZUNA_SEARCH_TITLES + (search_terms or [])))
     rows: list[dict] = []
     scraped_at = datetime.now(timezone.utc)
     for term in terms:
-        try:
-            resp = requests.get(
-                f"{_API_BASE}/{country}/search/1",
-                params={
-                    "app_id": app_id,
-                    "app_key": app_key,
-                    "what": term,
-                    "results_per_page": 20,
-                    "content-type": "application/json",
-                },
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception:
-            continue
-        for job in data.get("results", []) or []:
-            if not isinstance(job, dict):
+        term_raw = 0
+        term_rows = 0
+        for page in range(1, config.ADZUNA_PAGES_PER_QUERY + 1):
+            try:
+                resp = requests.get(
+                    f"{_API_BASE}/{country}/search/{page}",
+                    params={
+                        "app_id": app_id,
+                        "app_key": app_key,
+                        "what": term,
+                        "results_per_page": config.ADZUNA_RESULTS_PER_PAGE,
+                        "content-type": "application/json",
+                    },
+                    timeout=timeout,
+                )
+                logger.info("adzuna query=%r page=%s status=%s", term, page, resp.status_code)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                logger.warning("adzuna query=%r page=%s failed: %s", term, page, e)
                 continue
-            row = normalize_adzuna_job(job, scraped_at)
-            if row is not None:
-                row["scraped_at"] = scraped_at.isoformat()
-                rows.append(row)
+            page_results = data.get("results", []) or []
+            term_raw += len(page_results)
+            logger.info("adzuna query=%r page=%s raw_count=%s", term, page, len(page_results))
+            for job in page_results:
+                if not isinstance(job, dict):
+                    continue
+                row = normalize_adzuna_job(job, scraped_at)
+                if row is not None:
+                    row["scraped_at"] = scraped_at.isoformat()
+                    rows.append(row)
+                    term_rows += 1
+            if not page_results:
+                break
+        logger.info("adzuna query=%r raw_count=%s normalized_count=%s", term, term_raw, term_rows)
+    logger.info("adzuna total_normalized_count=%s", len(rows))
     return pd.DataFrame(rows)

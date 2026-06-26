@@ -39,7 +39,7 @@ export default function UploadForm({ onSubmit }) {
         rank each match using AI.
       </p>
       <p className="mt-1 text-sm text-stone-400">
-        Searches Past 24 hours first, widening to Past 3 days if needed.
+        Searches recent postings from the last 30 hours.
       </p>
 
       <div

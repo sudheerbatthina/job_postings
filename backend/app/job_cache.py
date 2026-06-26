@@ -5,6 +5,7 @@ The cache decouples user search latency/reliability from live job-board scraping
 
 from __future__ import annotations
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -18,10 +19,16 @@ import pandas as pd
 from . import config, freshness, scraper
 from .sources import ats_sources, google_jobs_serpapi, arbeitnow, adzuna
 
+logger = logging.getLogger(__name__)
+
 SOURCE_COUNT_KEYS = [
     "linkedin_count",
     "indeed_count",
     "google_jobs_count",
+    "serpapi_google_jobs_count",
+    "jobspy_linkedin_count",
+    "jobspy_google_count",
+    "jobspy_indeed_count",
     "greenhouse_count",
     "lever_count",
     "ashby_count",
@@ -334,6 +341,10 @@ def source_counts_from_df(df: pd.DataFrame) -> dict:
     counts["linkedin_count"] = int((values == "linkedin").sum())
     counts["indeed_count"] = int((values == "indeed").sum())
     counts["google_jobs_count"] = int((values == "google_jobs").sum() + (values == "google").sum())
+    counts["serpapi_google_jobs_count"] = int((values == "google_jobs").sum())
+    counts["jobspy_linkedin_count"] = int((values == "linkedin").sum())
+    counts["jobspy_google_count"] = int((values == "google").sum())
+    counts["jobspy_indeed_count"] = int((values == "indeed").sum())
     counts["greenhouse_count"] = int((values == "greenhouse").sum())
     counts["lever_count"] = int((values == "lever").sum())
     counts["ashby_count"] = int((values == "ashby").sum())
@@ -350,6 +361,10 @@ def format_source_counts(counts: dict) -> str:
         f"sources linkedin={counts.get('linkedin_count', 0)}, "
         f"indeed={counts.get('indeed_count', 0)}, "
         f"google_jobs={counts.get('google_jobs_count', 0)}, "
+        f"serpapi_google_jobs={counts.get('serpapi_google_jobs_count', 0)}, "
+        f"jobspy_linkedin={counts.get('jobspy_linkedin_count', 0)}, "
+        f"jobspy_google={counts.get('jobspy_google_count', 0)}, "
+        f"jobspy_indeed={counts.get('jobspy_indeed_count', 0)}, "
         f"greenhouse={counts.get('greenhouse_count', 0)}, "
         f"lever={counts.get('lever_count', 0)}, "
         f"ashby={counts.get('ashby_count', 0)}, "
@@ -529,7 +544,7 @@ def refresh_job_cache(
 ) -> dict:
     empty_counts = _empty_source_counts()
     pruned_before = prune_old_jobs(config.MAX_JOB_AGE_HOURS)
-    if not force and not is_cache_stale(config.JOB_CACHE_MAX_AGE_MINUTES) and count_jobs() > 0:
+    if not force and not is_cache_stale(config.CACHE_MAX_AGE_MINUTES) and count_jobs() > 0:
         return {
             "status": "skipped",
             "raw_count": 0,
@@ -553,25 +568,28 @@ def refresh_job_cache(
     try:
         terms = search_terms or config.DEFAULT_STEM_SEARCH_TITLES
         frames = []
-        for fetcher in (
-            lambda: fetch_jobspy_jobs(location, is_remote, hours_old, on_progress, terms),
-            lambda: fetch_google_jobs(terms, location),
-            fetch_company_ats_jobs,
-            fetch_arbeitnow_jobs,
-            lambda: fetch_adzuna_jobs(terms),
+        for label, fetcher in (
+            ("jobspy", lambda: fetch_jobspy_jobs(location, is_remote, hours_old, on_progress, terms)),
+            ("serpapi_google_jobs", lambda: fetch_google_jobs(terms, location)),
+            ("company_ats", fetch_company_ats_jobs),
+            ("arbeitnow", fetch_arbeitnow_jobs),
+            ("adzuna", lambda: fetch_adzuna_jobs(terms)),
         ):
             try:
                 frame = fetcher()
+                logger.info("cache refresh source=%s raw_count=%s", label, 0 if frame is None else len(frame))
                 if frame is not None and not frame.empty:
                     frames.append(frame)
-            except Exception:
+            except Exception as e:
+                logger.warning("cache refresh source=%s failed: %s", label, e)
                 continue
-        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        df = dedupe_prefer_sources(df)
-        source_counts = source_counts_from_df(df)
+        raw_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        source_counts = source_counts_from_df(raw_df)
+        df = dedupe_prefer_sources(raw_df)
         counts = upsert_jobs(df, scraped_at=_iso_now())
         status = "done"
         message = format_source_counts(source_counts)
+        logger.info("cache refresh source_counts=%s deduped_count=%s", source_counts, len(df))
     except Exception as e:
         counts = {"raw_count": 0, "inserted_count": 0, "updated_count": 0}
         status = "error"
@@ -634,6 +652,56 @@ def get_latest_source_counts() -> dict:
     counts = _empty_source_counts()
     counts.update({key: int(data.get(key, 0) or 0) for key in SOURCE_COUNT_KEYS})
     return counts
+
+
+def get_cache_debug() -> dict:
+    age = get_cache_age_minutes()
+    with _conn() as con:
+        total = con.execute("SELECT COUNT(*) AS n FROM jobs_cache").fetchone()["n"]
+        latest_run = con.execute(
+            """
+            SELECT status, raw_count, inserted_count, updated_count, source_counts, message, finished_at
+            FROM job_cache_runs
+            ORDER BY COALESCE(finished_at, started_at) DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        rows = con.execute(
+            "SELECT source_type, source, freshness_bucket, posted_at_ts FROM jobs_cache"
+        ).fetchall()
+    df = pd.DataFrame([dict(row) for row in rows])
+    source_counts = source_counts_from_df(df) if not df.empty else _empty_source_counts()
+    freshness_counts = (
+        df["freshness_bucket"].fillna("unknown").value_counts().to_dict()
+        if not df.empty and "freshness_bucket" in df.columns
+        else {}
+    )
+    latest_posted = None
+    if not df.empty:
+        posted = pd.to_datetime(df.get("posted_at_ts"), errors="coerce", utc=True)
+        if posted.notna().any():
+            latest_posted = posted.max().isoformat()
+    latest_source_counts = _empty_source_counts()
+    if latest_run and latest_run["source_counts"]:
+        try:
+            latest_source_counts.update(json.loads(latest_run["source_counts"]))
+        except (TypeError, json.JSONDecodeError):
+            pass
+    return {
+        "cache_age_minutes": age,
+        "total_jobs": int(total or 0),
+        "jobs_by_source": source_counts,
+        "jobs_by_freshness_bucket": freshness_counts,
+        "latest_posted_at_ts": latest_posted,
+        "last_refresh": dict(latest_run) if latest_run else None,
+        "last_refresh_source_counts": latest_source_counts,
+        "config": {
+            "MAX_JOB_AGE_HOURS": config.MAX_JOB_AGE_HOURS,
+            "DEFAULT_RESULT_LIMIT": config.DEFAULT_RESULT_LIMIT,
+            "CANDIDATE_POOL_LIMIT": config.CANDIDATE_POOL_LIMIT,
+            "ENABLE_SEEN_FILTER": config.ENABLE_SEEN_FILTER,
+        },
+    }
 
 
 def is_cache_stale(max_age_minutes: int = config.JOB_CACHE_MAX_AGE_MINUTES) -> bool:

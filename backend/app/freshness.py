@@ -111,8 +111,8 @@ def freshness_bucket(posted_at_ts) -> str:
     minutes = max(0, int((datetime.now(timezone.utc) - posted).total_seconds() // 60))
     if minutes <= 24 * 60:
         return "24h"
-    if minutes <= 72 * 60:
-        return "72h"
+    if minutes <= 30 * 60:
+        return "30h"
     return "old"
 
 
