@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 import pandas as pd
 
 from . import config, freshness, scraper
-from .sources import ats_sources, google_jobs_serpapi
+from .sources import ats_sources, google_jobs_serpapi, arbeitnow, adzuna
 
 SOURCE_COUNT_KEYS = [
     "linkedin_count",
@@ -27,6 +27,8 @@ SOURCE_COUNT_KEYS = [
     "ashby_count",
     "workday_count",
     "company_portal_count",
+    "arbeitnow_count",
+    "adzuna_count",
     "total_cache_jobs",
 ]
 
@@ -40,6 +42,8 @@ SOURCE_PRIORITY = {
     "google_jobs": 3,
     "google": 3,
     "indeed": 4,
+    "arbeitnow": 4,
+    "adzuna": 4,
 }
 
 _DB_PATH = os.environ.get("JOB_CACHE_DB_PATH", "/data/job_cache.db")
@@ -335,6 +339,8 @@ def source_counts_from_df(df: pd.DataFrame) -> dict:
     counts["ashby_count"] = int((values == "ashby").sum())
     counts["workday_count"] = int((values == "workday").sum())
     counts["company_portal_count"] = int((values == "company_portal").sum())
+    counts["arbeitnow_count"] = int((values == "arbeitnow").sum())
+    counts["adzuna_count"] = int((values == "adzuna").sum())
     counts["total_cache_jobs"] = int(len(df))
     return counts
 
@@ -349,6 +355,8 @@ def format_source_counts(counts: dict) -> str:
         f"ashby={counts.get('ashby_count', 0)}, "
         f"workday={counts.get('workday_count', 0)}, "
         f"company_portal={counts.get('company_portal_count', 0)}, "
+        f"arbeitnow={counts.get('arbeitnow_count', 0)}, "
+        f"adzuna={counts.get('adzuna_count', 0)}, "
         f"total={counts.get('total_cache_jobs', 0)}"
     )
 
@@ -366,6 +374,14 @@ def fetch_jobspy_jobs(location, is_remote, hours_old, on_progress=None, search_t
 
 def fetch_google_jobs(search_terms: list[str], location: str) -> pd.DataFrame:
     return google_jobs_serpapi.fetch_google_jobs(search_terms, location)
+
+
+def fetch_arbeitnow_jobs() -> pd.DataFrame:
+    return arbeitnow.fetch_arbeitnow_jobs()
+
+
+def fetch_adzuna_jobs(search_terms: list[str] | None = None) -> pd.DataFrame:
+    return adzuna.fetch_adzuna_jobs(search_terms=search_terms)
 
 
 def fetch_company_ats_jobs() -> pd.DataFrame:
@@ -541,6 +557,8 @@ def refresh_job_cache(
             lambda: fetch_jobspy_jobs(location, is_remote, hours_old, on_progress, terms),
             lambda: fetch_google_jobs(terms, location),
             fetch_company_ats_jobs,
+            fetch_arbeitnow_jobs,
+            lambda: fetch_adzuna_jobs(terms),
         ):
             try:
                 frame = fetcher()

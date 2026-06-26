@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 import anthropic
 import pandas as pd
+import requests as _requests
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -26,7 +27,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from . import config, jobs_store, resume_parser, resume_store, scoring, export, dedup, job_cache
+from . import config, freshness, jobs_store, resume_parser, resume_store, scoring, export, dedup, job_cache
 
 # ---------------------------------------------------------------------------
 # App + rate limiter
@@ -221,6 +222,57 @@ def _recent_shortlist(df: pd.DataFrame, limit: int) -> pd.DataFrame:
 
 def _update_trail(job_id: str, trail: list[str]) -> None:
     jobs_store.update_job(job_id, message=" → ".join(trail))
+
+
+def _fetch_jobposting_date(url: str) -> str | None:
+    """Fetch a job page and extract datePosted from JSON-LD. Returns ISO string or None."""
+    try:
+        resp = _requests.get(url, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+        return freshness.extract_jobposting_schema(resp.text)
+    except Exception:
+        return None
+
+
+async def _enrich_posted_times(df: pd.DataFrame) -> pd.DataFrame:
+    """Fetch job pages for top-N day/unknown-precision results to get exact posted time.
+
+    Only fires for jobs that lack minute/hour precision — ones already enriched are skipped.
+    Capped at ENRICHMENT_TOP_N to bound added latency. Failures are silently ignored.
+    """
+    if df.empty:
+        return df
+    df = df.copy()
+    prec = df.get("posted_precision") if "posted_precision" in df.columns else None
+    if prec is None:
+        return df
+    needs = prec.fillna("unknown").isin(["day", "unknown"])
+    candidates = df[needs].nlargest(config.ENRICHMENT_TOP_N, "ats_score", keep="all")
+    if candidates.empty:
+        return df
+    for idx in candidates.index:
+        url = df.at[idx, "job_url"] if "job_url" in df.columns else None
+        if not url:
+            continue
+        try:
+            date_str = await asyncio.wait_for(
+                asyncio.to_thread(_fetch_jobposting_date, url),
+                timeout=6,
+            )
+        except Exception:
+            continue
+        if not date_str:
+            continue
+        try:
+            posted = freshness.normalize_posted_fields({"date_posted": date_str})
+            if posted.get("posted_at_ts"):
+                df.at[idx, "posted_at_ts"] = posted["posted_at_ts"]
+                df.at[idx, "posted_precision"] = posted.get("posted_precision")
+                df.at[idx, "posted_age_minutes"] = posted.get("posted_age_minutes")
+                df.at[idx, "posted_age_label"] = posted.get("posted_age_label")
+                df.at[idx, "freshness_bucket"] = posted.get("freshness_bucket")
+        except Exception:
+            continue
+    return df
 
 
 async def _run_cached_search(
@@ -443,6 +495,9 @@ async def _run_cached_search(
         scoring.apply_final_score_rules,
         scoring.add_role_relevance(scored, target_profile),
     )
+
+    # Enrich posted-time precision for top results that only have day-level dates.
+    scored = await _enrich_posted_times(scored)
 
     fallback_count = (
         int(scored["used_fallback_score"].fillna(False).sum())

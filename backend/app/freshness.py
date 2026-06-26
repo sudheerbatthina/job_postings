@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
@@ -257,6 +258,40 @@ def normalize_posted_fields(row: dict, reference_time: datetime | None = None) -
         "posted_precision": precision,
         "freshness_bucket": bucket,
     }
+
+
+def extract_jobposting_schema(html: str) -> str | None:
+    """Parse HTML for a JobPosting JSON-LD script block and return datePosted if found.
+
+    Many job pages embed structured data like:
+      <script type="application/ld+json">{"@type":"JobPosting","datePosted":"2024-06-15T10:30:00"}</script>
+
+    Returns an ISO date/datetime string, or None if not present or parsing fails.
+    This is always safe to call — all errors are swallowed and return None.
+    """
+    try:
+        from bs4 import BeautifulSoup  # optional dep — falls back gracefully if missing
+        soup = BeautifulSoup(html or "", "html.parser")
+        for tag in soup.find_all("script", {"type": "application/ld+json"}):
+            try:
+                data = json.loads(tag.string or "")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            candidates: list[dict] = []
+            if data.get("@type") == "JobPosting":
+                candidates.append(data)
+            for item in data.get("@graph", []) or []:
+                if isinstance(item, dict) and item.get("@type") == "JobPosting":
+                    candidates.append(item)
+            for candidate in candidates:
+                date_posted = candidate.get("datePosted")
+                if date_posted and isinstance(date_posted, str) and date_posted.strip():
+                    return date_posted.strip()
+    except Exception:
+        pass
+    return None
 
 
 def is_recent_enough(job, max_age_hours: int = 30) -> bool:

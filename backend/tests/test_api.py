@@ -112,6 +112,8 @@ def _install_cache_fakes(monkeypatch, get_recent_jobs=None, count_jobs=3, stale=
         lambda df, resume_hash: (df.reset_index(drop=True), df.iloc[0:0].copy()),
     )
     monkeypatch.setattr(main.dedup, "mark_seen", lambda df, resume_hash=None: None)
+    # Disable HTTP enrichment in tests — fake job URLs would time out.
+    monkeypatch.setattr(main, "_fetch_jobposting_date", lambda url: None)
 
 
 # ---------------------------------------------------------------------------
@@ -697,6 +699,8 @@ def test_stale_cache_refreshes_with_broad_stem_titles(monkeypatch, tmp_path):
     monkeypatch.setattr(main.job_cache.scraper, "scrape_all", capture_scrape)
     monkeypatch.setattr(main.job_cache, "fetch_google_jobs", lambda *args, **kwargs: pd.DataFrame())
     monkeypatch.setattr(main.job_cache, "fetch_company_ats_jobs", lambda: pd.DataFrame())
+    monkeypatch.setattr(main.job_cache, "fetch_arbeitnow_jobs", lambda: pd.DataFrame())
+    monkeypatch.setattr(main.job_cache, "fetch_adzuna_jobs", lambda *args, **kwargs: pd.DataFrame())
 
     assert main.job_cache.is_cache_stale()
     result = main.job_cache.refresh_job_cache(force=False, location="United States", is_remote=False)
@@ -836,6 +840,8 @@ def test_source_counts_are_stored_on_cache_refresh(monkeypatch, tmp_path):
     monkeypatch.setattr(main.job_cache, "fetch_jobspy_jobs", lambda *args, **kwargs: jobspy)
     monkeypatch.setattr(main.job_cache, "fetch_google_jobs", lambda *args, **kwargs: google)
     monkeypatch.setattr(main.job_cache, "fetch_company_ats_jobs", lambda: ats)
+    monkeypatch.setattr(main.job_cache, "fetch_arbeitnow_jobs", lambda: pd.DataFrame())
+    monkeypatch.setattr(main.job_cache, "fetch_adzuna_jobs", lambda *args, **kwargs: pd.DataFrame())
 
     result = main.job_cache.refresh_job_cache(force=True)
     counts = result["source_counts"]
@@ -979,6 +985,8 @@ def test_source_failure_does_not_fail_full_cache_refresh(monkeypatch, tmp_path):
     monkeypatch.setattr(main.job_cache, "fetch_jobspy_jobs", failing_jobspy)
     monkeypatch.setattr(main.job_cache, "fetch_google_jobs", lambda *args, **kwargs: pd.DataFrame())
     monkeypatch.setattr(main.job_cache, "fetch_company_ats_jobs", lambda: ats)
+    monkeypatch.setattr(main.job_cache, "fetch_arbeitnow_jobs", lambda: pd.DataFrame())
+    monkeypatch.setattr(main.job_cache, "fetch_adzuna_jobs", lambda *args, **kwargs: pd.DataFrame())
 
     result = main.job_cache.refresh_job_cache(force=True)
     assert result["status"] == "done"
@@ -1809,3 +1817,183 @@ def test_glassdoor_location_filtering(monkeypatch):
     assert all("zip_recruiter" not in sites for sites in captured_site_lists), (
         f"ZipRecruiter should be disabled by default, got site lists: {captured_site_lists}"
     )
+
+
+# ---------------------------------------------------------------------------
+# JSON-LD posted-time enrichment tests
+# ---------------------------------------------------------------------------
+
+def test_extract_jobposting_schema_parses_valid_jsonld():
+    """Valid JobPosting JSON-LD script tag returns datePosted."""
+    html = """
+    <html><head>
+    <script type="application/ld+json">
+    {"@context":"https://schema.org","@type":"JobPosting","datePosted":"2024-06-15T10:30:00","title":"AI Engineer"}
+    </script>
+    </head><body></body></html>
+    """
+    result = freshness.extract_jobposting_schema(html)
+    assert result == "2024-06-15T10:30:00"
+
+
+def test_extract_jobposting_schema_parses_graph_array():
+    """@graph array containing a JobPosting node also yields datePosted."""
+    html = """
+    <html><head>
+    <script type="application/ld+json">
+    {"@context":"https://schema.org","@graph":[
+      {"@type":"WebPage","name":"Job"},
+      {"@type":"JobPosting","datePosted":"2024-06-20","title":"ML Engineer"}
+    ]}
+    </script>
+    </head><body></body></html>
+    """
+    result = freshness.extract_jobposting_schema(html)
+    assert result == "2024-06-20"
+
+
+def test_extract_jobposting_schema_returns_none_on_missing_script():
+    """HTML with no JSON-LD script returns None without crashing."""
+    assert freshness.extract_jobposting_schema("<html><body>nothing here</body></html>") is None
+    assert freshness.extract_jobposting_schema("") is None
+    assert freshness.extract_jobposting_schema(None) is None
+
+
+def test_extract_jobposting_schema_returns_none_on_malformed_json():
+    """Malformed JSON in script tag returns None without crashing."""
+    html = '<script type="application/ld+json">{not: valid json}</script>'
+    assert freshness.extract_jobposting_schema(html) is None
+
+
+def test_extract_jobposting_schema_ignores_non_jobposting_types():
+    """JSON-LD of a different @type (e.g. BreadcrumbList) returns None."""
+    html = """
+    <script type="application/ld+json">
+    {"@type":"BreadcrumbList","datePosted":"2024-06-15"}
+    </script>
+    """
+    assert freshness.extract_jobposting_schema(html) is None
+
+
+# ---------------------------------------------------------------------------
+# Arbeitnow normalizer tests
+# ---------------------------------------------------------------------------
+
+def test_arbeitnow_normalizer_produces_correct_schema():
+    """AI-relevant Arbeitnow job is normalized to the expected schema fields."""
+    from app.sources.arbeitnow import normalize_arbeitnow_job
+
+    job = {
+        "title": "Machine Learning Engineer",
+        "company_name": "MLCorp",
+        "location": "Remote",
+        "description": "Build LLM and RAG pipelines with PyTorch.",
+        "remote": True,
+        "url": "https://arbeitnow.com/jobs/mlcorp/ml-eng-123",
+        "created_at": 1718000000,
+        "slug": "ml-eng-123",
+    }
+    from datetime import datetime, timezone
+    scraped_at = datetime(2024, 6, 10, 12, 0, 0, tzinfo=timezone.utc)
+    row = normalize_arbeitnow_job(job, scraped_at)
+
+    assert row is not None
+    assert row["source_type"] == "arbeitnow"
+    assert row["title"] == "Machine Learning Engineer"
+    assert row["company"] == "MLCorp"
+    assert row["is_remote"] is True
+    assert row["job_url"] == "https://arbeitnow.com/jobs/mlcorp/ml-eng-123"
+    assert row["apply_url"] == row["job_url"]
+    assert "posted_precision" in row
+
+
+def test_arbeitnow_normalizer_skips_non_ai_jobs():
+    """Non-AI jobs (e.g. sales) are filtered out and return None."""
+    from app.sources.arbeitnow import normalize_arbeitnow_job
+
+    job = {
+        "title": "Sales Account Executive",
+        "company_name": "SellCo",
+        "location": "New York",
+        "description": "Sell our SaaS product to enterprise clients.",
+        "remote": False,
+        "url": "https://arbeitnow.com/jobs/sellco/sales-123",
+        "created_at": 1718000000,
+    }
+    assert normalize_arbeitnow_job(job) is None
+
+
+# ---------------------------------------------------------------------------
+# Adzuna normalizer tests
+# ---------------------------------------------------------------------------
+
+def test_adzuna_normalizer_produces_correct_schema():
+    """AI-relevant Adzuna job is normalized to the expected schema fields."""
+    from app.sources.adzuna import normalize_adzuna_job
+    from datetime import datetime, timezone
+
+    job = {
+        "title": "Senior AI Engineer",
+        "description": "Work on LLM fine-tuning and embeddings at scale.",
+        "company": {"display_name": "AICo"},
+        "location": {"display_name": "San Francisco, CA"},
+        "redirect_url": "https://adzuna.com/jobs/ai-eng-456",
+        "created": "2024-06-14T08:00:00Z",
+        "salary_min": 150000,
+        "salary_max": 210000,
+    }
+    scraped_at = datetime(2024, 6, 15, 0, 0, 0, tzinfo=timezone.utc)
+    row = normalize_adzuna_job(job, scraped_at)
+
+    assert row is not None
+    assert row["source_type"] == "adzuna"
+    assert row["title"] == "Senior AI Engineer"
+    assert row["company"] == "AICo"
+    assert row["location"] == "San Francisco, CA"
+    assert row["job_url"] == "https://adzuna.com/jobs/ai-eng-456"
+    assert row["min_amount"] == 150000
+    assert row["max_amount"] == 210000
+    assert row["posted_at_ts"] is not None
+
+
+def test_adzuna_fetch_skips_gracefully_when_keys_missing(monkeypatch):
+    """fetch_adzuna_jobs returns empty DataFrame when env keys are absent."""
+    from app.sources.adzuna import fetch_adzuna_jobs
+    monkeypatch.delenv("ADZUNA_APP_ID", raising=False)
+    monkeypatch.delenv("ADZUNA_APP_KEY", raising=False)
+    df = fetch_adzuna_jobs()
+    assert df.empty
+
+
+# ---------------------------------------------------------------------------
+# Enrichment precision-gate test
+# ---------------------------------------------------------------------------
+
+def test_enrichment_only_fires_for_day_level_precision(monkeypatch):
+    """_enrich_posted_times only fetches pages for day/unknown precision rows,
+    never for rows that already have minute or hour precision."""
+    fetched_urls = []
+
+    def mock_fetch(url, *args, **kwargs):
+        fetched_urls.append(url)
+        return None
+
+    monkeypatch.setattr(main, "_fetch_jobposting_date", mock_fetch)
+
+    df = pd.DataFrame([
+        {"job_url": "http://a.com/minute", "ats_score": 90,
+         "posted_precision": "minute", "posted_at_ts": "2024-06-15T10:00:00Z"},
+        {"job_url": "http://a.com/hour", "ats_score": 85,
+         "posted_precision": "hour", "posted_at_ts": "2024-06-15T09:00:00Z"},
+        {"job_url": "http://a.com/day", "ats_score": 80,
+         "posted_precision": "day", "posted_at_ts": "2024-06-15T00:00:00Z"},
+        {"job_url": "http://a.com/unknown", "ats_score": 75,
+         "posted_precision": "unknown", "posted_at_ts": None},
+    ])
+
+    asyncio.run(main._enrich_posted_times(df))
+
+    assert "http://a.com/minute" not in fetched_urls
+    assert "http://a.com/hour" not in fetched_urls
+    assert "http://a.com/day" in fetched_urls
+    assert "http://a.com/unknown" in fetched_urls
