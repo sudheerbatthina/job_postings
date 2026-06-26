@@ -529,9 +529,11 @@ def claude_score(
         raw_text = _message_text(msg)
         data = _first_json_object(raw_text)
         if data is None:
+            stop_reason = getattr(msg, "stop_reason", None)
             logger.warning(
-                "claude_score: no JSON object in response; response_len=%s job_title=%r",
-                len(raw_text), (job_title or "")[:80],
+                "claude_score: no JSON object in response; response_len=%s stop_reason=%s "
+                "max_tokens=200 raw_preview=%r job_title=%r",
+                len(raw_text), stop_reason, raw_text[:300], (job_title or "")[:80],
             )
             return _SCORE_FAILED
         return {

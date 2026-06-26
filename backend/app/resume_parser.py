@@ -111,11 +111,15 @@ def _first_json_object(raw_text: str) -> dict | None:
 def _log_parse_failure(reason: str, raw_text: str, message=None) -> None:
     content = getattr(message, "content", None)
     block_count = len(content) if isinstance(content, list) else None
+    stop_reason = getattr(message, "stop_reason", None)
     logger.warning(
-        "extract_keywords parse failed: reason=%s response_len=%s content_blocks=%s",
+        "extract_keywords parse failed: reason=%s response_len=%s content_blocks=%s "
+        "stop_reason=%s max_tokens=300 raw_preview=%r",
         reason,
         len(raw_text or ""),
         block_count,
+        stop_reason,
+        (raw_text or "")[:300],
     )
 
 
