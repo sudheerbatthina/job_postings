@@ -30,6 +30,13 @@ function salaryLabel(min, max) {
   return fmt(min || max);
 }
 
+function bandLabel(band) {
+  if (band === "strong") return "Strong";
+  if (band === "good") return "Good";
+  if (band === "broader") return "Broader";
+  return "Match";
+}
+
 export default function ResultsTable({ results, lowConfidenceResults = [], jobId, onReset }) {
   const [minScore, setMinScore] = useState(65);
   const [remoteOnly, setRemoteOnly] = useState(false);
@@ -51,7 +58,7 @@ export default function ResultsTable({ results, lowConfidenceResults = [], jobId
   if (results.length === 0 && lowConfidenceResults.length === 0) {
     return (
       <div className="w-full max-w-xl mx-auto text-center py-16">
-        <p className="text-stone-700">No strong AI/ML matches found right now.</p>
+        <p className="text-stone-700">No strong AI/ML matches from the latest jobs yet.</p>
         <p className="mt-1 text-sm text-stone-500">The job boards may not have new postings yet — try again in a few hours.</p>
         <button onClick={onReset} className="mt-6 text-teal-700 font-medium hover:underline">
           Try another search
@@ -64,7 +71,7 @@ export default function ResultsTable({ results, lowConfidenceResults = [], jobId
     <div className="w-full max-w-3xl mx-auto">
       <div className="flex items-center justify-between flex-wrap gap-3">
         <h2 className="text-xl font-semibold text-stone-900">
-          {filtered.length} {showBroader ? "broader" : "strong"} match{filtered.length === 1 ? "" : "es"}
+          {filtered.length} {showBroader ? "broader" : "strong/good AI/ML"} match{filtered.length === 1 ? "" : "es"}
         </h2>
         <div className="flex items-center gap-3">
           <a
@@ -116,14 +123,15 @@ export default function ResultsTable({ results, lowConfidenceResults = [], jobId
             }}
             className="text-sm font-medium text-teal-700 hover:underline"
           >
-            {showBroader ? "Hide broader low-confidence matches" : "Show broader low-confidence matches"}
+            {showBroader ? "Hide broader matches" : "Show broader matches"}
           </button>
         </div>
       )}
 
       {results.length === 0 && lowConfidenceResults.length > 0 && !showBroader && (
         <div className="w-full max-w-xl mx-auto text-center py-12">
-          <p className="text-stone-700">No strong AI/ML matches found right now.</p>
+          <p className="text-stone-700">No strong AI/ML matches from the latest jobs yet.</p>
+          <p className="mt-1 text-sm text-stone-500">Try lowering the score filter or checking broader matches.</p>
         </div>
       )}
 
@@ -150,6 +158,11 @@ export default function ResultsTable({ results, lowConfidenceResults = [], jobId
                   <p className="text-sm text-stone-500 truncate">
                     {job.company} · {job.location} · {relativeTime(job.date_posted)}
                     {salary ? ` · ${salary}` : ""}
+                  </p>
+                  <p className="text-xs text-stone-400 truncate">
+                    {bandLabel(job.match_band)} match
+                    {job.posted_age_label ? ` · ${job.posted_age_label}` : ""}
+                    {job.source ? ` · ${job.source}` : ""}
                   </p>
                   {showBroader && job.exclude_reason && (
                     <p className="text-xs text-amber-700 truncate">{job.exclude_reason}</p>

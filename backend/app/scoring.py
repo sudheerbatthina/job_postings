@@ -122,6 +122,89 @@ _INFRA_ADMIN_TERMS = ["splunk", "observability", "administrator", "admin", "moni
 _ANALYTICS_TERMS = ["business intelligence", "bi ", "tableau", "power bi", "reporting", "dashboard"]
 
 
+def _parse_posted_date(value):
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return None
+        return value.date()
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return pd.to_datetime(text, errors="coerce", utc=True).date()
+    except Exception:
+        return None
+
+
+def freshness_for_date(value) -> dict:
+    posted = _parse_posted_date(value)
+    if posted is None:
+        return {
+            "posted_age_days": None,
+            "posted_age_label": "Unknown date",
+            "freshness_bucket": "unknown",
+            "freshness_score": 0.25,
+        }
+    days = max(0, (date.today() - posted).days)
+    if days == 0:
+        label = "Today"
+        bucket = "24h"
+        freshness = 1.0
+    elif days == 1:
+        label = "Yesterday"
+        bucket = "72h"
+        freshness = 0.85
+    elif days <= 3:
+        label = f"{days} days ago"
+        bucket = "72h"
+        freshness = 0.72
+    elif days <= config.MAX_NORMAL_JOB_AGE_DAYS:
+        label = f"{days} days ago"
+        bucket = "7d"
+        freshness = 0.50
+    else:
+        label = f"{days} days ago"
+        bucket = "old"
+        freshness = 0.10
+    return {
+        "posted_age_days": days,
+        "posted_age_label": label,
+        "freshness_bucket": bucket,
+        "freshness_score": freshness,
+    }
+
+
+def add_freshness_metadata(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    if "date_posted" not in df.columns:
+        df["date_posted"] = None
+    meta = [freshness_for_date(value) for value in df["date_posted"]]
+    for key in ("posted_age_days", "posted_age_label", "freshness_bucket", "freshness_score"):
+        df[key] = [item[key] for item in meta]
+    return df
+
+
+def match_band(score: int | float | None, excluded: bool = False) -> str:
+    if excluded or score is None:
+        return "hidden"
+    score = float(score)
+    if score >= 80:
+        return "strong"
+    if score >= config.DEFAULT_MIN_ATS_SCORE:
+        return "good"
+    if score >= config.BROADER_MIN_ATS_SCORE:
+        return "broader"
+    return "hidden"
+
+
 def _text_for_job(job) -> tuple[str, str, str]:
     title = str(job.get("title", "") if hasattr(job, "get") else "")
     company = str(job.get("company", "") if hasattr(job, "get") else "")
@@ -155,6 +238,13 @@ def classify_job_relevance(job, target_profile: dict | None = None) -> dict:
     if primary_track != "applied_ai_ml":
         return _relevance_result("other", 50, False, "")
 
+    for term in ("internship", "intern", "new grad", "student", "university graduate"):
+        if term in title:
+            return _relevance_result(
+                "other", 20, True,
+                f"excluded role term: {term}",
+            )
+
     if _has_any(title, _CONSULTING_TERMS) or "pharma technology" in text:
         if has_ai_signal and hands_on:
             return _relevance_result("applied_ai_ml", 62, False, "")
@@ -170,6 +260,13 @@ def classify_job_relevance(job, target_profile: dict | None = None) -> dict:
             "infra_admin", 25, True,
             "Splunk/admin/observability role without explicit AI/ML engineering",
         )
+
+    for term in config.DEFAULT_EXCLUDED_ROLE_TERMS:
+        if term in title:
+            return _relevance_result(
+                "other", 25, True,
+                f"excluded role term: {term}",
+            )
 
     if _has_any(title, _DATA_ENGINEERING_TITLE_TERMS):
         if _has_any(text, [
@@ -216,10 +313,47 @@ def classify_job_relevance(job, target_profile: dict | None = None) -> dict:
 def add_role_relevance(df: pd.DataFrame, target_profile: dict | None = None) -> pd.DataFrame:
     if df.empty:
         return df
-    df = df.copy()
+    df = add_freshness_metadata(df.copy())
     classifications = [classify_job_relevance(row, target_profile) for _, row in df.iterrows()]
     for key in ("job_family", "role_relevance", "exclude_by_default", "exclude_reason"):
         df[key] = [item[key] for item in classifications]
+    return df
+
+
+def apply_final_score_rules(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = add_freshness_metadata(df.copy())
+    final_scores = []
+    bands = []
+    exclude_flags = []
+    exclude_reasons = []
+    for _, row in df.iterrows():
+        base = float(row.get("ats_score") or 0)
+        relevance = float(row.get("role_relevance") or 0)
+        freshness = float(row.get("freshness_score") or 0)
+        score = (0.55 * base) + (0.30 * relevance) + (0.15 * freshness * 100)
+        excluded = bool(row.get("exclude_by_default"))
+        reason = str(row.get("exclude_reason") or "")
+        bucket = row.get("freshness_bucket")
+        if bucket == "old":
+            score = min(score, 49)
+            excluded = True
+            reason = reason or "job is older than 7 days"
+        elif bucket == "unknown" and score < 80:
+            score = min(score, 64)
+            reason = reason or "unknown posting date"
+        if excluded:
+            score = min(score, 49)
+        rounded = max(0, min(100, int(round(score))))
+        final_scores.append(rounded)
+        exclude_flags.append(excluded)
+        exclude_reasons.append(reason)
+        bands.append(match_band(rounded, excluded))
+    df["ats_score"] = final_scores
+    df["exclude_by_default"] = exclude_flags
+    df["exclude_reason"] = exclude_reasons
+    df["match_band"] = bands
     return df
 
 
@@ -289,6 +423,7 @@ def fallback_score_dataframe(
     df["matched_keywords"] = [[] for _ in range(len(df))]
     df["confidence"] = df["role_relevance"]
     df["used_fallback_score"] = True
+    df = apply_final_score_rules(df)
     return sort_scored(df)
 
 
@@ -441,6 +576,7 @@ def score_with_claude(
     df["exclude_reason"] = exclude_reasons
     df["confidence"] = confidence
     df["used_fallback_score"] = fallback_flags
+    df = apply_final_score_rules(df)
     return sort_scored(df)
 
 

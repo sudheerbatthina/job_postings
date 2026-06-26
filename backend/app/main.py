@@ -220,7 +220,10 @@ async def _run_cached_search(
     top_results: int,
     trail: list[str],
 ) -> None:
-    windows = [hours_old] + [h for h in config.FALLBACK_HOURS if h > hours_old]
+    windows = [hours_old] + [
+        h for h in config.FALLBACK_HOURS
+        if h > hours_old and h <= config.MAX_NORMAL_JOB_AGE_DAYS * 24
+    ]
     resume_hash_value = dedup.resume_hash(
         resume_text, target_profile.get("primary_track", "applied_ai_ml")
     )
@@ -235,6 +238,8 @@ async def _run_cached_search(
     age_label = "unknown" if cache_age is None else f"{cache_age:.1f}m"
     trail.append(f"Job cache age: {age_label}; cached jobs: {cache_count}")
     trail.append(job_cache.format_source_counts(source_counts))
+    if not config.ENABLE_SEEN_FILTER:
+        trail.append("Seen filter disabled")
     _update_trail(job_id, trail)
 
     cache_stale = await asyncio.to_thread(
@@ -262,7 +267,7 @@ async def _run_cached_search(
     selected_window = windows[-1]
     for window in windows:
         candidate_df = await asyncio.to_thread(job_cache.get_recent_jobs, window)
-        trail.append(f"{window}h cached jobs selected: {len(candidate_df)}")
+        trail.append(f"Jobs from {window}h: {len(candidate_df)}")
         _update_trail(job_id, trail)
         raw_df = candidate_df
         selected_window = window
@@ -281,7 +286,7 @@ async def _run_cached_search(
     raw_df = await asyncio.to_thread(scoring.dedupe_display_jobs, raw_df)
     relevant_pool = await asyncio.to_thread(scoring.add_role_relevance, raw_df, target_profile)
     allowed_count = int((~relevant_pool["exclude_by_default"].fillna(True)).sum())
-    trail.append(f"AI/ML relevant cached jobs: {allowed_count}")
+    trail.append(f"Jobs after role filter: {allowed_count}")
     _update_trail(job_id, trail)
 
     if allowed_count < top_results:
@@ -314,34 +319,49 @@ async def _run_cached_search(
 
     excluded_pool = relevant_pool[relevant_pool["exclude_by_default"].fillna(True)].copy()
     allowed_pool = relevant_pool[~relevant_pool["exclude_by_default"].fillna(True)].reset_index(drop=True)
+    normal_mask = allowed_pool["freshness_bucket"].isin(["24h", "72h", "7d", "unknown"])
+    old_allowed = allowed_pool[~normal_mask].copy()
+    if not old_allowed.empty:
+        old_allowed["exclude_by_default"] = True
+        old_allowed["exclude_reason"] = "job is older than 7 days"
+        excluded_pool = pd.concat([excluded_pool, old_allowed], ignore_index=True)
+    allowed_pool = allowed_pool[normal_mask].reset_index(drop=True)
+    trail.append(f"Jobs after internship/old-job exclusion: {len(allowed_pool)}")
+    _update_trail(job_id, trail)
 
     if allowed_pool.empty:
         low_confidence = scoring.fallback_score_dataframe(
             excluded_pool, resume_tokens, selected_window, target_profile
         )
+        if not low_confidence.empty:
+            low_confidence = low_confidence[low_confidence["match_band"] == "broader"]
         low_confidence = scoring.dedupe_display_jobs(scoring.sort_scored(low_confidence)).head(top_results)
         jobs_store.set_results(
             job_id,
             pd.DataFrame(),
-            message="No strong AI/ML matches found right now. Lower the score filter to see broader roles.",
+            message="No strong AI/ML matches from the latest jobs yet. Try lowering the score filter or checking broader matches.",
             low_confidence_df=low_confidence,
         )
         return
 
-    unseen_df, seen_df = await asyncio.to_thread(dedup.split_seen, allowed_pool, resume_hash_value)
-    if not unseen_df.empty:
-        unseen_df = unseen_df.copy()
-        unseen_df["seen_before"] = False
-    trail.append(f"Unseen cached jobs: {len(unseen_df)}")
-
-    if len(unseen_df) < top_results and not seen_df.empty:
-        needed = top_results - len(unseen_df)
-        candidate_df = pd.concat([unseen_df, seen_df.head(needed)], ignore_index=True)
-        used_seen_fallback = True
-        trail.append(f"Seen-fill jobs: {min(needed, len(seen_df))}")
+    if config.ENABLE_SEEN_FILTER:
+        unseen_df, seen_df = await asyncio.to_thread(dedup.split_seen, allowed_pool, resume_hash_value)
+        if not unseen_df.empty:
+            unseen_df = unseen_df.copy()
+            unseen_df["seen_before"] = False
+        trail.append(f"Unseen cached jobs: {len(unseen_df)}")
+        if len(unseen_df) < top_results and not seen_df.empty:
+            needed = top_results - len(unseen_df)
+            candidate_df = pd.concat([unseen_df, seen_df.head(needed)], ignore_index=True)
+            used_seen_fallback = True
+            trail.append(f"Seen-fill jobs: {min(needed, len(seen_df))}")
+        else:
+            candidate_df = unseen_df
+            trail.append("Seen-fill jobs: 0")
     else:
-        candidate_df = unseen_df
-        trail.append("Seen-fill jobs: 0")
+        candidate_df = allowed_pool.copy()
+        candidate_df["seen_before"] = False
+        trail.append(f"Seen filter disabled; candidates unchanged: {len(candidate_df)}")
     _update_trail(job_id, trail)
 
     if candidate_df.empty:
@@ -386,6 +406,10 @@ async def _run_cached_search(
         scored = await asyncio.to_thread(
             scoring.fallback_score_dataframe, filtered, resume_tokens, selected_window, target_profile
         )
+    scored = await asyncio.to_thread(
+        scoring.apply_final_score_rules,
+        scoring.add_role_relevance(scored, target_profile),
+    )
 
     fallback_count = (
         int(scored["used_fallback_score"].fillna(False).sum())
@@ -403,15 +427,12 @@ async def _run_cached_search(
         jobs_store.set_results(
             job_id,
             pd.DataFrame(),
-            message="No strong AI/ML matches found right now. Lower the score filter to see broader roles.",
+            message="No strong AI/ML matches from the latest jobs yet. Try lowering the score filter or checking broader matches.",
             low_confidence_df=pd.DataFrame(),
         )
         return
 
-    strong = scored[
-        (~scored["exclude_by_default"].fillna(False))
-        & (scored["ats_score"].fillna(0) >= config.DEFAULT_MIN_ATS_SCORE)
-    ].copy()
+    strong = scored[scored["match_band"].isin(["strong", "good"])].copy()
     scored_low = scored.drop(strong.index, errors="ignore")
     excluded_low = scoring.fallback_score_dataframe(
         excluded_pool, resume_tokens, selected_window, target_profile
@@ -422,6 +443,8 @@ async def _run_cached_search(
         if low_parts
         else pd.DataFrame()
     ).head(top_results).reset_index(drop=True)
+    if not low_confidence.empty:
+        low_confidence = low_confidence[low_confidence["match_band"] == "broader"].reset_index(drop=True)
 
     final = scoring.sort_scored(strong).head(top_results).reset_index(drop=True)
     final.insert(0, "rank", range(1, len(final) + 1))
@@ -431,7 +454,8 @@ async def _run_cached_search(
     trail.append(f"Low-confidence jobs separated: {len(low_confidence)}")
     _update_trail(job_id, trail)
 
-    await asyncio.to_thread(dedup.mark_seen, final, resume_hash_value)
+    if config.ENABLE_SEEN_FILTER:
+        await asyncio.to_thread(dedup.mark_seen, final, resume_hash_value)
 
     notes = []
     if cache_refreshed:
@@ -445,7 +469,7 @@ async def _run_cached_search(
 
     n = len(final)
     if n == 0:
-        done_msg = "No strong AI/ML matches found right now. Lower the score filter to see broader roles."
+        done_msg = "No strong AI/ML matches from the latest jobs yet. Try lowering the score filter or checking broader matches."
     elif n < top_results:
         done_msg = f"Found {n} strong AI/ML match{'' if n == 1 else 'es'}. Lower the score filter to see broader roles."
     else:

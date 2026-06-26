@@ -181,7 +181,7 @@ def test_results_sorted_by_ats_score(monkeypatch):
             return df
         df = df.copy()
         # Assign scores below the old 75/50 cutoffs — both should still appear
-        scores = {"http://x/1": 45, "http://x/2": 30}
+        scores = {"http://x/1": 20, "http://x/2": 10}
         df["ats_score"] = df["job_url"].map(scores).fillna(0).astype(int)
         df["missing_keywords"] = [[] for _ in range(len(df))]
         return df.sort_values("ats_score", ascending=False).reset_index(drop=True)
@@ -214,9 +214,8 @@ def test_results_sorted_by_ats_score(monkeypatch):
         results = body["results"]
         low_confidence = body["low_confidence_results"]
         assert results == []
-        assert len(low_confidence) >= 2
-        assert low_confidence[0]["ats_score"] == 45
-        assert low_confidence[1]["ats_score"] == 30
+        assert len(low_confidence) == 1
+        assert low_confidence[0]["match_band"] == "broader"
         assert low_confidence[0]["title"] == "Senior AI Engineer"
 
 
@@ -892,7 +891,8 @@ def test_dedup_empty_falls_back_to_seen_jobs(monkeypatch):
 
     assert body["status"] == "done", body
     assert len(body["results"]) >= 1
-    assert "previously seen jobs" in body["message"]
+    assert "Seen filter disabled" in body["message"]
+    assert "previously seen jobs" not in body["message"]
 
 
 def test_prefilter_empty_bypasses_to_recent_shortlist(monkeypatch):
@@ -1093,12 +1093,13 @@ def test_pipeline_separates_strong_and_low_confidence_matches(monkeypatch):
     assert body["status"] == "done", body
     assert [row["job_url"] for row in body["results"]] == ["http://rel/ai"]
     low_urls = {row["job_url"] for row in body["low_confidence_results"]}
-    assert "http://rel/de" in low_urls
-    assert "http://rel/pharma" in low_urls
+    assert "http://rel/ai" not in low_urls
+    assert "http://rel/de" not in {row["job_url"] for row in body["results"]}
+    assert "http://rel/pharma" not in {row["job_url"] for row in body["results"]}
     assert "strong AI/ML" in body["message"]
 
 
-def test_seen_logic_marks_only_strong_displayed_jobs(monkeypatch):
+def test_seen_logic_disabled_does_not_mark_displayed_jobs(monkeypatch):
     marked_urls = []
     jobs = pd.DataFrame([
         {
@@ -1141,7 +1142,166 @@ def test_seen_logic_marks_only_strong_displayed_jobs(monkeypatch):
         body = _wait_for_done(c, r.json()["job_id"])
 
     assert body["status"] == "done", body
-    assert marked_urls == ["http://seen/ai"]
+    assert marked_urls == []
+    assert "Seen filter disabled" in body["message"]
+
+
+def _run_with_cached_jobs(monkeypatch, jobs: pd.DataFrame, score_map: dict[str, int] | None = None):
+    def score_jobs(df, resume_text, skill_signals, total_yoe, client, *args):
+        df = df.copy()
+        scores = score_map or {}
+        df["ats_score"] = df["job_url"].map(scores).fillna(90).astype(int)
+        df["missing_keywords"] = [[] for _ in range(len(df))]
+        return df
+
+    _install_cache_fakes(monkeypatch, get_recent_jobs=lambda hours_old: jobs, count_jobs=len(jobs))
+    monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
+    monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
+    monkeypatch.setattr(main.resume_parser, "extract_keywords", lambda text, client: _FAKE_KW)
+    monkeypatch.setattr(main.scoring, "score_with_claude", score_jobs)
+
+    with TestClient(main.app) as c:
+        r = c.post(
+            "/api/analyze",
+            files={"resume": ("resume.txt", b"Applied AI LLM RAG MLOps Python", "text/plain")},
+            data={"location": "United States", "is_remote": "false", "hours_old": "24"},
+        )
+        assert r.status_code == 200, r.text
+        return _wait_for_done(c, r.json()["job_id"])
+
+
+def test_old_jobs_older_than_7_days_excluded_from_main_results(monkeypatch):
+    jobs = pd.DataFrame([
+        {
+            "title": "Applied AI Engineer",
+            "company": "FreshCo",
+            "location": "Remote",
+            "date_posted": date.today(),
+            "job_url": "http://fresh/ai",
+            "description": "Build LLM RAG systems with MLOps.",
+        },
+        {
+            "title": "Applied AI Engineer",
+            "company": "OldCo",
+            "location": "Remote",
+            "date_posted": date.today() - timedelta(days=79),
+            "job_url": "http://old/ai",
+            "description": "Build LLM RAG systems with MLOps.",
+        },
+    ])
+
+    body = _run_with_cached_jobs(monkeypatch, jobs)
+    assert body["status"] == "done", body
+    urls = {row["job_url"] for row in body["results"]}
+    assert "http://fresh/ai" in urls
+    assert "http://old/ai" not in urls
+
+
+def test_unknown_date_jobs_need_80_plus_for_main_results(monkeypatch):
+    jobs = pd.DataFrame([
+        {
+            "title": "Applied AI Engineer",
+            "company": "UnknownOkay",
+            "location": "Remote",
+            "date_posted": None,
+            "job_url": "http://unknown/strong",
+            "description": "Build LLM RAG systems with MLOps.",
+        },
+        {
+            "title": "Applied AI Engineer",
+            "company": "UnknownBroad",
+            "location": "Remote",
+            "date_posted": None,
+            "job_url": "http://unknown/broad",
+            "description": "Build LLM RAG systems with MLOps.",
+        },
+    ])
+
+    body = _run_with_cached_jobs(
+        monkeypatch,
+        jobs,
+        {"http://unknown/strong": 95, "http://unknown/broad": 60},
+    )
+    urls = {row["job_url"] for row in body["results"]}
+    assert "http://unknown/strong" in urls
+    assert "http://unknown/broad" not in urls
+    assert all(row["freshness_bucket"] == "unknown" for row in body["results"])
+
+
+def test_internship_jobs_are_excluded_by_default(monkeypatch):
+    jobs = pd.DataFrame([
+        {
+            "title": "AI Engineer Internship",
+            "company": "InternCo",
+            "location": "Remote",
+            "date_posted": date.today(),
+            "job_url": "http://intern/ai",
+            "description": "Build LLM RAG systems with MLOps.",
+        },
+        {
+            "title": "GenAI Engineer",
+            "company": "GenCo",
+            "location": "Remote",
+            "date_posted": date.today(),
+            "job_url": "http://genai/ai",
+            "description": "Build LLM RAG systems.",
+        },
+    ])
+
+    body = _run_with_cached_jobs(monkeypatch, jobs)
+    urls = {row["job_url"] for row in body["results"]}
+    assert "http://genai/ai" in urls
+    assert "http://intern/ai" not in urls
+
+
+def test_mlops_and_ai_data_engineering_recent_jobs_can_appear(monkeypatch):
+    jobs = pd.DataFrame([
+        {
+            "title": "MLOps Engineer",
+            "company": "OpsAI",
+            "location": "Remote",
+            "date_posted": date.today(),
+            "job_url": "http://mlops/ai",
+            "description": "Deploy model serving, inference, and MLOps platforms.",
+        },
+        {
+            "title": "Data Engineer",
+            "company": "FeatureCo",
+            "location": "Remote",
+            "date_posted": date.today(),
+            "job_url": "http://data/ml",
+            "description": "Build ML pipelines, MLOps, RAG, feature engineering, vector search, and model deployment.",
+        },
+    ])
+
+    body = _run_with_cached_jobs(monkeypatch, jobs, {"http://mlops/ai": 88, "http://data/ml": 82})
+    urls = {row["job_url"] for row in body["results"]}
+    assert "http://mlops/ai" in urls
+    assert "http://data/ml" in urls
+
+
+def test_does_not_fill_top_10_with_bad_jobs(monkeypatch):
+    rows = [{
+        "title": "Applied AI Engineer",
+        "company": "StrongCo",
+        "location": "Remote",
+        "date_posted": date.today(),
+        "job_url": "http://one/strong",
+        "description": "Build LLM RAG systems with MLOps.",
+    }]
+    for i in range(12):
+        rows.append({
+            "title": f"Business Analyst {i}",
+            "company": "BadCo",
+            "location": "Remote",
+            "date_posted": date.today(),
+            "job_url": f"http://bad/{i}",
+            "description": "Reporting dashboards and stakeholder analysis.",
+        })
+    body = _run_with_cached_jobs(monkeypatch, pd.DataFrame(rows))
+
+    assert body["status"] == "done", body
+    assert [row["job_url"] for row in body["results"]] == ["http://one/strong"]
 
 
 def test_frontend_default_min_score_is_65():

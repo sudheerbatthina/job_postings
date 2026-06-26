@@ -19,6 +19,9 @@ JOB_CACHE_REFRESH_HOURS = 168
 MIN_RAW_JOBS_FOR_RESULTS = 20
 SEEN_TTL_HOURS = 24
 DEFAULT_MIN_ATS_SCORE = 65
+ENABLE_SEEN_FILTER = False
+MAX_NORMAL_JOB_AGE_DAYS = 7
+BROADER_MIN_ATS_SCORE = 50
 
 DEFAULT_SEARCH_TITLES = [
     "AI Engineer",
@@ -45,6 +48,23 @@ APPLIED_AI_TARGET_TITLES = [
     "AI Platform Engineer",
     "MLOps Engineer",
     "Applied Scientist",
+]
+
+DEFAULT_TARGET_ROLES = APPLIED_AI_TARGET_TITLES
+
+DEFAULT_EXCLUDED_ROLE_TERMS = [
+    "internship",
+    "intern",
+    "new grad",
+    "student",
+    "university graduate",
+    "consultant manager",
+    "technology consultant manager",
+    "splunk engineer",
+    "bi analyst",
+    "business analyst",
+    "data analyst",
+    "pharma technology consultant",
 ]
 
 APPLIED_AI_MUST_HAVE_SIGNALS = [
