@@ -43,9 +43,30 @@ function resultHeading(results, showBroader) {
   return allStrong ? "strong" : "good AI/ML";
 }
 
+const SORT_OPTIONS = [
+  { value: "recommended", label: "Recommended" },
+  { value: "top_matched", label: "Top Matched" },
+  { value: "most_recent", label: "Most Recent" },
+];
+
+function applySort(jobs, sortBy) {
+  if (sortBy === "top_matched") {
+    return [...jobs].sort((a, b) => (b.ats_score ?? 0) - (a.ats_score ?? 0));
+  }
+  if (sortBy === "most_recent") {
+    return [...jobs].sort((a, b) => {
+      const ta = a.posted_at_ts ? new Date(a.posted_at_ts).getTime() : 0;
+      const tb = b.posted_at_ts ? new Date(b.posted_at_ts).getTime() : 0;
+      return tb - ta;
+    });
+  }
+  return jobs; // "recommended" — backend order preserved
+}
+
 export default function ResultsTable({ results, lowConfidenceResults = [], jobId, onReset }) {
   const [minScore, setMinScore] = useState(65);
   const [remoteOnly, setRemoteOnly] = useState(false);
+  const [sortBy, setSortBy] = useState("recommended");
   const [expandedUrl, setExpandedUrl] = useState(null);
   const [showBroader, setShowBroader] = useState(false);
   const visibleResults = useMemo(
@@ -53,13 +74,12 @@ export default function ResultsTable({ results, lowConfidenceResults = [], jobId
     [showBroader, results, lowConfidenceResults]
   );
 
-  const filtered = useMemo(
-    () =>
-      visibleResults
-        .filter((r) => (r.ats_score ?? 0) >= minScore)
-        .filter((r) => !remoteOnly || r.is_remote),
-    [visibleResults, minScore, remoteOnly]
-  );
+  const filtered = useMemo(() => {
+    const base = visibleResults
+      .filter((r) => (r.ats_score ?? 0) >= minScore)
+      .filter((r) => !remoteOnly || r.is_remote);
+    return applySort(base, sortBy);
+  }, [visibleResults, minScore, remoteOnly, sortBy]);
 
   if (results.length === 0 && lowConfidenceResults.length === 0) {
     return (
@@ -118,6 +138,15 @@ export default function ResultsTable({ results, lowConfidenceResults = [], jobId
           />
           Remote only
         </label>
+        <select
+          value={sortBy}
+          onChange={(e) => setSortBy(e.target.value)}
+          className="text-sm text-stone-600 border border-stone-200 rounded-md px-2 py-1 bg-white focus:outline-none focus:ring-1 focus:ring-teal-600"
+        >
+          {SORT_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>{opt.label}</option>
+          ))}
+        </select>
       </div>
 
       {lowConfidenceResults.length > 0 && (
