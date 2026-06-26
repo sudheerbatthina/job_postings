@@ -2,16 +2,23 @@
 
 SITES = ["linkedin", "indeed", "google", "glassdoor"]
 COUNTRY_INDEED = "USA"
+DISABLED_SOURCES = ["zip_recruiter"]
+ENABLE_JOBSPY_LINKEDIN = True
+ENABLE_SERPAPI_GOOGLE_JOBS = True
+ENABLE_COMPANY_ATS_SOURCES = True
+ENABLE_INDEED_FALLBACK = True
+SOURCE_REQUEST_TIMEOUT_SECONDS = 10
 
 RESULTS_WANTED_PER_TERM = 25
 DEFAULT_HOURS_OLD = 24
 FALLBACK_HOURS = [72, 168, 336]
-RESUME_ANALYSIS_VERSION = 2
+RESUME_ANALYSIS_VERSION = 3
 PREFILTER_BYPASS_LIMIT = 25
 JOB_CACHE_MAX_AGE_MINUTES = 60
 JOB_CACHE_REFRESH_HOURS = 168
 MIN_RAW_JOBS_FOR_RESULTS = 20
 SEEN_TTL_HOURS = 24
+DEFAULT_MIN_ATS_SCORE = 65
 
 DEFAULT_SEARCH_TITLES = [
     "AI Engineer",
@@ -24,6 +31,54 @@ DEFAULT_SEARCH_TITLES = [
     "ML Engineer",
     "ML Platform Engineer",
 ]
+
+APPLIED_AI_TARGET_TITLES = [
+    "Applied AI Engineer",
+    "AI Engineer",
+    "AI/ML Engineer",
+    "Machine Learning Engineer",
+    "ML Engineer",
+    "GenAI Engineer",
+    "LLM Engineer",
+    "Agentic AI Engineer",
+    "RAG Engineer",
+    "AI Platform Engineer",
+    "MLOps Engineer",
+    "Applied Scientist",
+]
+
+APPLIED_AI_MUST_HAVE_SIGNALS = [
+    "Machine Learning",
+    "LLM",
+    "GenAI",
+    "RAG",
+    "MLOps",
+    "model deployment",
+    "embeddings",
+    "vector search",
+]
+
+APPLIED_AI_SECONDARY_SIGNALS = [
+    "Python",
+    "PyTorch",
+    "TensorFlow",
+    "LangChain",
+    "LangGraph",
+    "OpenAI",
+    "Anthropic",
+    "AWS",
+    "GCP",
+    "Azure",
+    "Docker",
+    "Kubernetes",
+]
+
+DEFAULT_TARGET_PROFILE = {
+    "primary_track": "applied_ai_ml",
+    "target_titles": APPLIED_AI_TARGET_TITLES,
+    "must_have_signals": APPLIED_AI_MUST_HAVE_SIGNALS,
+    "secondary_signals": APPLIED_AI_SECONDARY_SIGNALS,
+}
 
 DEFAULT_STEM_SEARCH_TITLES = [
     "AI Engineer",

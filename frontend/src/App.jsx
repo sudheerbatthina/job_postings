@@ -13,6 +13,7 @@ export default function App() {
   const [stage, setStage] = useState("upload");
   const [message, setMessage] = useState("");
   const [results, setResults] = useState([]);
+  const [lowConfidenceResults, setLowConfidenceResults] = useState([]);
   const [jobId, setJobId] = useState(null);
   const [storedResume, setStoredResume] = useState(null);
   const pollRef = useRef(null);
@@ -64,6 +65,7 @@ export default function App() {
       if (data.status === "done") {
         clearInterval(pollRef.current);
         setResults(data.results || []);
+        setLowConfidenceResults(data.low_confidence_results || []);
         setStage("done");
         // Refresh stored resume info so "New search" goes back to ready stage
         getStoredResume()
@@ -83,6 +85,7 @@ export default function App() {
 
   const reset = () => {
     setResults([]);
+    setLowConfidenceResults([]);
     setJobId(null);
     setMessage("");
     setStage(storedResume ? "ready" : "upload");
@@ -104,7 +107,14 @@ export default function App() {
         />
       )}
       {stage === "polling" && <ProgressView message={message} />}
-      {stage === "done" && <ResultsTable results={results} jobId={jobId} onReset={reset} />}
+      {stage === "done" && (
+        <ResultsTable
+          results={results}
+          lowConfidenceResults={lowConfidenceResults}
+          jobId={jobId}
+          onReset={reset}
+        />
+      )}
       {stage === "error" && (
         <div className="w-full max-w-xl mx-auto text-center py-16">
           <p className="font-medium text-stone-900">{message}</p>

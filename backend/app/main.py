@@ -75,12 +75,14 @@ def get_resume():
     analysis = resume_parser.normalize_resume_analysis({
         "search_titles": json.loads(stored.get("search_titles") or "[]"),
         "skill_signals": json.loads(stored.get("skill_signals") or "[]"),
+        "target_profile": _stored_target_profile(stored),
         "total_yoe": stored.get("total_yoe") or 0,
     })
     return {
         "filename": stored.get("filename"),
         "search_titles": analysis["search_titles"],
         "skill_signals": analysis["skill_signals"],
+        "target_profile": analysis["target_profile"],
         "total_yoe": analysis["total_yoe"],
         "email": stored.get("email"),
         "stored_at": stored.get("stored_at"),
@@ -126,6 +128,7 @@ def get_status(job_id: str):
         "status": job["status"],
         "message": job["message"],
         "results": job["results"],
+        "low_confidence_results": job.get("low_confidence_results") or [],
         "error": job["error"],
     }
 
@@ -182,6 +185,15 @@ def _cache_analysis_valid(stored: dict | None) -> bool:
     return len(resume_parser.sanitize_search_titles(_stored_search_titles(stored))) >= 3
 
 
+def _stored_target_profile(stored: dict | None) -> dict | None:
+    if not stored:
+        return None
+    try:
+        return json.loads(stored.get("target_profile") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
 def _recent_shortlist(df: pd.DataFrame, limit: int) -> pd.DataFrame:
     if df.empty:
         return df
@@ -200,6 +212,7 @@ async def _run_cached_search(
     resume_text: str,
     resume_tokens: set[str],
     skill_signals: list[str],
+    target_profile: dict,
     total_yoe: int | None,
     location: str,
     is_remote: bool,
@@ -208,7 +221,9 @@ async def _run_cached_search(
     trail: list[str],
 ) -> None:
     windows = [hours_old] + [h for h in config.FALLBACK_HOURS if h > hours_old]
-    resume_hash_value = dedup.resume_hash(resume_text)
+    resume_hash_value = dedup.resume_hash(
+        resume_text, target_profile.get("primary_track", "applied_ai_ml")
+    )
     used_seen_fallback = False
     used_prefilter_bypass = False
     used_score_fallback = False
@@ -216,8 +231,10 @@ async def _run_cached_search(
 
     cache_age = await asyncio.to_thread(job_cache.get_cache_age_minutes)
     cache_count = await asyncio.to_thread(job_cache.count_jobs)
+    source_counts = await asyncio.to_thread(job_cache.get_latest_source_counts)
     age_label = "unknown" if cache_age is None else f"{cache_age:.1f}m"
     trail.append(f"Job cache age: {age_label}; cached jobs: {cache_count}")
+    trail.append(job_cache.format_source_counts(source_counts))
     _update_trail(job_id, trail)
 
     cache_stale = await asyncio.to_thread(
@@ -238,6 +255,7 @@ async def _run_cached_search(
             f"Cache refresh {refresh.get('status')}: raw {refresh.get('raw_count', 0)}, "
             f"inserted {refresh.get('inserted_count', 0)}, updated {refresh.get('updated_count', 0)}"
         )
+        trail.append(job_cache.format_source_counts(refresh.get("source_counts", {})))
         _update_trail(job_id, trail)
 
     raw_df = pd.DataFrame()
@@ -252,15 +270,65 @@ async def _run_cached_search(
             break
 
     if raw_df.empty:
-        jobs_store.update_job(
+        jobs_store.set_results(
             job_id,
-            status="done",
-            message="No matching jobs found because the job cache is empty",
-            results=[],
+            pd.DataFrame(),
+            message="No strong AI/ML matches found right now because the job cache is empty.",
+            low_confidence_df=pd.DataFrame(),
         )
         return
 
-    unseen_df, seen_df = await asyncio.to_thread(dedup.split_seen, raw_df, resume_hash_value)
+    raw_df = await asyncio.to_thread(scoring.dedupe_display_jobs, raw_df)
+    relevant_pool = await asyncio.to_thread(scoring.add_role_relevance, raw_df, target_profile)
+    allowed_count = int((~relevant_pool["exclude_by_default"].fillna(True)).sum())
+    trail.append(f"AI/ML relevant cached jobs: {allowed_count}")
+    _update_trail(job_id, trail)
+
+    if allowed_count < top_results:
+        cache_refreshed = True
+        target_titles = target_profile.get("target_titles") or config.DEFAULT_SEARCH_TITLES
+        trail.append("Refreshing job cache with target AI/ML titles")
+        _update_trail(job_id, trail)
+        refresh = await asyncio.to_thread(
+            job_cache.refresh_job_cache,
+            True,
+            location,
+            is_remote,
+            config.JOB_CACHE_REFRESH_HOURS,
+            None,
+            target_titles,
+        )
+        trail.append(
+            f"Targeted refresh {refresh.get('status')}: raw {refresh.get('raw_count', 0)}, "
+            f"inserted {refresh.get('inserted_count', 0)}, updated {refresh.get('updated_count', 0)}"
+        )
+        trail.append(job_cache.format_source_counts(refresh.get("source_counts", {})))
+        _update_trail(job_id, trail)
+        refreshed_df = await asyncio.to_thread(job_cache.get_recent_jobs, selected_window)
+        if not refreshed_df.empty:
+            raw_df = await asyncio.to_thread(scoring.dedupe_display_jobs, refreshed_df)
+            relevant_pool = await asyncio.to_thread(scoring.add_role_relevance, raw_df, target_profile)
+            allowed_count = int((~relevant_pool["exclude_by_default"].fillna(True)).sum())
+            trail.append(f"AI/ML relevant jobs after target refresh: {allowed_count}")
+            _update_trail(job_id, trail)
+
+    excluded_pool = relevant_pool[relevant_pool["exclude_by_default"].fillna(True)].copy()
+    allowed_pool = relevant_pool[~relevant_pool["exclude_by_default"].fillna(True)].reset_index(drop=True)
+
+    if allowed_pool.empty:
+        low_confidence = scoring.fallback_score_dataframe(
+            excluded_pool, resume_tokens, selected_window, target_profile
+        )
+        low_confidence = scoring.dedupe_display_jobs(scoring.sort_scored(low_confidence)).head(top_results)
+        jobs_store.set_results(
+            job_id,
+            pd.DataFrame(),
+            message="No strong AI/ML matches found right now. Lower the score filter to see broader roles.",
+            low_confidence_df=low_confidence,
+        )
+        return
+
+    unseen_df, seen_df = await asyncio.to_thread(dedup.split_seen, allowed_pool, resume_hash_value)
     if not unseen_df.empty:
         unseen_df = unseen_df.copy()
         unseen_df["seen_before"] = False
@@ -277,10 +345,10 @@ async def _run_cached_search(
     _update_trail(job_id, trail)
 
     if candidate_df.empty:
-        candidate_df = raw_df.copy()
+        candidate_df = allowed_pool.copy()
         candidate_df["seen_before"] = True
         used_seen_fallback = True
-        trail.append(f"All cached jobs were seen; scoring cached pool: {len(candidate_df)}")
+        trail.append(f"All relevant cached jobs were seen; scoring relevant pool: {len(candidate_df)}")
         _update_trail(job_id, trail)
 
     filtered = await asyncio.to_thread(scoring.prefilter, candidate_df, resume_tokens)
@@ -293,7 +361,7 @@ async def _run_cached_search(
     _update_trail(job_id, trail)
 
     if filtered.empty:
-        filtered = _recent_shortlist(raw_df, config.PREFILTER_BYPASS_LIMIT)
+        filtered = _recent_shortlist(allowed_pool, config.PREFILTER_BYPASS_LIMIT)
         used_prefilter_bypass = True
         trail.append(f"Showing best recent matches from cached jobs: {len(filtered)}")
         _update_trail(job_id, trail)
@@ -309,13 +377,14 @@ async def _run_cached_search(
                 ai_client,
                 resume_tokens,
                 selected_window,
+                target_profile,
             ),
             timeout=config.SCRAPE_TIMEOUT_SECONDS,
         )
     except Exception as e:
         logger.warning("score_with_claude failed, using fallback scores: %s", e)
         scored = await asyncio.to_thread(
-            scoring.fallback_score_dataframe, filtered, resume_tokens, selected_window
+            scoring.fallback_score_dataframe, filtered, resume_tokens, selected_window, target_profile
         )
 
     fallback_count = (
@@ -331,17 +400,35 @@ async def _run_cached_search(
     _update_trail(job_id, trail)
 
     if scored.empty:
-        jobs_store.update_job(
+        jobs_store.set_results(
             job_id,
-            status="done",
-            message="No matching jobs found because the job cache is empty",
-            results=[],
+            pd.DataFrame(),
+            message="No strong AI/ML matches found right now. Lower the score filter to see broader roles.",
+            low_confidence_df=pd.DataFrame(),
         )
         return
 
-    final = scoring.sort_scored(scored).head(top_results).reset_index(drop=True)
+    strong = scored[
+        (~scored["exclude_by_default"].fillna(False))
+        & (scored["ats_score"].fillna(0) >= config.DEFAULT_MIN_ATS_SCORE)
+    ].copy()
+    scored_low = scored.drop(strong.index, errors="ignore")
+    excluded_low = scoring.fallback_score_dataframe(
+        excluded_pool, resume_tokens, selected_window, target_profile
+    )
+    low_parts = [part for part in (scored_low, excluded_low) if not part.empty]
+    low_confidence = (
+        scoring.dedupe_display_jobs(scoring.sort_scored(pd.concat(low_parts, ignore_index=True)))
+        if low_parts
+        else pd.DataFrame()
+    ).head(top_results).reset_index(drop=True)
+
+    final = scoring.sort_scored(strong).head(top_results).reset_index(drop=True)
     final.insert(0, "rank", range(1, len(final) + 1))
+    if not low_confidence.empty:
+        low_confidence.insert(0, "rank", range(1, len(low_confidence) + 1))
     trail.append(f"Final jobs returned: {len(final)}")
+    trail.append(f"Low-confidence jobs separated: {len(low_confidence)}")
     _update_trail(job_id, trail)
 
     await asyncio.to_thread(dedup.mark_seen, final, resume_hash_value)
@@ -357,11 +444,16 @@ async def _run_cached_search(
         notes.append("fallback scoring used for some jobs")
 
     n = len(final)
-    done_msg = f"Found {n} matching job{'' if n == 1 else 's'}"
+    if n == 0:
+        done_msg = "No strong AI/ML matches found right now. Lower the score filter to see broader roles."
+    elif n < top_results:
+        done_msg = f"Found {n} strong AI/ML match{'' if n == 1 else 'es'}. Lower the score filter to see broader roles."
+    else:
+        done_msg = f"Found {n} strong AI/ML match{'' if n == 1 else 'es'}"
     if notes:
         done_msg += " (" + "; ".join(notes) + ")"
     done_msg += " | " + " → ".join(trail)
-    jobs_store.set_results(job_id, final, message=done_msg)
+    jobs_store.set_results(job_id, final, message=done_msg, low_confidence_df=low_confidence)
 
 
 async def _run_analysis(
@@ -388,6 +480,7 @@ async def _run_analysis(
                 kw_dict = resume_parser.normalize_resume_analysis({
                     "search_titles": _stored_search_titles(stored),
                     "skill_signals": json.loads(stored.get("skill_signals") or "[]"),
+                    "target_profile": _stored_target_profile(stored),
                     "total_yoe": stored.get("total_yoe") or 0,
                 })
             else:
@@ -401,6 +494,7 @@ async def _run_analysis(
                     text=resume_text,
                     search_titles=json.dumps(kw_dict["search_titles"]),
                     skill_signals=json.dumps(kw_dict["skill_signals"]),
+                    target_profile=json.dumps(kw_dict["target_profile"]),
                     total_yoe=kw_dict["total_yoe"],
                     email=stored.get("email"),
                     phone=stored.get("phone"),
@@ -408,6 +502,7 @@ async def _run_analysis(
                 )
             search_titles = kw_dict["search_titles"]
             skill_signals = kw_dict["skill_signals"]
+            target_profile = kw_dict["target_profile"]
             total_yoe = kw_dict["total_yoe"]
         else:
             parsed = await asyncio.to_thread(resume_parser.parse_resume, filename, content)
@@ -420,12 +515,14 @@ async def _run_analysis(
             kw_dict = resume_parser.normalize_resume_analysis(kw_dict)
             search_titles = kw_dict.get("search_titles", [])
             skill_signals = kw_dict.get("skill_signals", [])
+            target_profile = kw_dict.get("target_profile", config.DEFAULT_TARGET_PROFILE)
             total_yoe = kw_dict.get("total_yoe")
             resume_store.save_resume(
                 filename=filename,
                 text=resume_text,
                 search_titles=json.dumps(search_titles),
                 skill_signals=json.dumps(skill_signals),
+                target_profile=json.dumps(target_profile),
                 total_yoe=total_yoe,
                 email=parsed.get("email"),
                 phone=parsed.get("phone"),
@@ -435,10 +532,12 @@ async def _run_analysis(
         normalized_analysis = resume_parser.normalize_resume_analysis({
             "search_titles": search_titles,
             "skill_signals": skill_signals,
+            "target_profile": target_profile,
             "total_yoe": total_yoe,
         })
         search_titles = normalized_analysis["search_titles"]
         skill_signals = normalized_analysis["skill_signals"]
+        target_profile = normalized_analysis["target_profile"]
         total_yoe = normalized_analysis["total_yoe"]
 
         # Accumulated stage trail — appended after each pipeline step and pushed
@@ -453,6 +552,7 @@ async def _run_analysis(
             resume_text=resume_text,
             resume_tokens=resume_tokens,
             skill_signals=skill_signals,
+            target_profile=target_profile,
             total_yoe=total_yoe,
             location=location,
             is_remote=is_remote,

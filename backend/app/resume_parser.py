@@ -23,12 +23,17 @@ _ROLE_WORDS = {
 
 _SEARCH_TITLE_ALIASES = {
     "ai engineer": "AI Engineer",
+    "ai/ml engineer": "AI/ML Engineer",
     "ml engineer": "ML Engineer",
     "machine learning engineer": "Machine Learning Engineer",
     "genai engineer": "GenAI Engineer",
     "generative ai engineer": "GenAI Engineer",
     "applied ai engineer": "Applied AI Engineer",
     "llm engineer": "LLM Engineer",
+    "agentic ai engineer": "Agentic AI Engineer",
+    "rag engineer": "RAG Engineer",
+    "ai platform engineer": "AI Platform Engineer",
+    "mlops engineer": "MLOps Engineer",
     "data scientist": "Data Scientist",
     "applied scientist": "Applied Scientist",
     "ml platform engineer": "ML Platform Engineer",
@@ -158,10 +163,40 @@ def normalize_resume_analysis(data: dict | None) -> dict:
     search_titles = _dedupe(
         sanitize_search_titles(data.get("search_titles")) + config.DEFAULT_SEARCH_TITLES
     )
+    target_profile = normalize_target_profile(data.get("target_profile"), search_titles)
     return {
         "search_titles": search_titles,
         "skill_signals": _dedupe(_as_string_list(data.get("skill_signals"))),
         "total_yoe": _optional_int(data.get("total_yoe")),
+        "target_profile": target_profile,
+    }
+
+
+def normalize_target_profile(raw_profile, search_titles: list[str] | None = None) -> dict:
+    profile = raw_profile if isinstance(raw_profile, dict) else {}
+    primary_track = str(profile.get("primary_track") or "applied_ai_ml").strip() or "applied_ai_ml"
+    if primary_track != "applied_ai_ml":
+        primary_track = "applied_ai_ml"
+
+    target_titles = sanitize_search_titles(profile.get("target_titles"))
+    if search_titles:
+        target_titles = _dedupe(target_titles + [
+            title for title in search_titles
+            if title in config.APPLIED_AI_TARGET_TITLES or title in config.DEFAULT_SEARCH_TITLES
+        ])
+    target_titles = _dedupe(target_titles + config.APPLIED_AI_TARGET_TITLES)
+
+    must_have = _dedupe(
+        _as_string_list(profile.get("must_have_signals")) + config.APPLIED_AI_MUST_HAVE_SIGNALS
+    )
+    secondary = _dedupe(
+        _as_string_list(profile.get("secondary_signals")) + config.APPLIED_AI_SECONDARY_SIGNALS
+    )
+    return {
+        "primary_track": primary_track,
+        "target_titles": target_titles,
+        "must_have_signals": must_have,
+        "secondary_signals": secondary,
     }
 
 
@@ -224,6 +259,7 @@ def fallback_resume_analysis(text: str) -> dict:
         "search_titles": config.DEFAULT_SEARCH_TITLES.copy(),
         "skill_signals": _fallback_skill_signals(text),
         "total_yoe": _estimate_total_yoe(text),
+        "target_profile": config.DEFAULT_TARGET_PROFILE.copy(),
     }
 
 
@@ -240,14 +276,23 @@ def extract_keywords(text: str, client: "_anthropic.Anthropic | None") -> dict:
                     "role": "user",
                     "content": (
                         "Return JSON only. Do not wrap it in markdown. Do not include commentary.\n"
-                        'Use exactly this shape: {"search_titles": [], "skill_signals": [], "total_yoe": null}\n'
+                        'Use exactly this shape: {"search_titles": [], "skill_signals": [], '
+                        '"total_yoe": null, "target_profile": {"primary_track": "applied_ai_ml", '
+                        '"target_titles": [], "must_have_signals": [], "secondary_signals": []}}\n'
                         "search_titles must be real job titles to search job boards with. "
                         "Never put tools, libraries, frameworks, vendors, concepts, or skill phrases "
                         "in search_titles. Bad search_titles include MCP tool, semantic reranking, "
                         "LangGraph OpenAI, OpenAI agents, and agents SDK.\n"
                         "skill_signals must be tools, skills, platforms, or technical concepts only. "
                         "total_yoe must be an integer estimate of professional years of experience, "
-                        "or null if unclear.\n\n"
+                        "or null if unclear. target_profile must describe the candidate's intended "
+                        "role family. For Applied AI, AI/ML, LLM, GenAI, Agentic AI, RAG, or MLOps "
+                        "engineering resumes, use primary_track applied_ai_ml and target_titles such "
+                        "as Applied AI Engineer, AI Engineer, AI/ML Engineer, Machine Learning "
+                        "Engineer, ML Engineer, GenAI Engineer, LLM Engineer, Agentic AI Engineer, "
+                        "RAG Engineer, AI Platform Engineer, MLOps Engineer, and Applied Scientist. "
+                        "Do not make generic Data Engineer a primary target unless the resume is "
+                        "clearly targeting AI/ML data platform work.\n\n"
                         "Resume:\n"
                         + text[:3000]
                     ),

@@ -30,23 +30,28 @@ function salaryLabel(min, max) {
   return fmt(min || max);
 }
 
-export default function ResultsTable({ results, jobId, onReset }) {
-  const [minScore, setMinScore] = useState(0);
+export default function ResultsTable({ results, lowConfidenceResults = [], jobId, onReset }) {
+  const [minScore, setMinScore] = useState(65);
   const [remoteOnly, setRemoteOnly] = useState(false);
   const [expandedUrl, setExpandedUrl] = useState(null);
+  const [showBroader, setShowBroader] = useState(false);
+  const visibleResults = useMemo(
+    () => (showBroader ? [...results, ...lowConfidenceResults] : results),
+    [showBroader, results, lowConfidenceResults]
+  );
 
   const filtered = useMemo(
     () =>
-      results
+      visibleResults
         .filter((r) => (r.ats_score ?? 0) >= minScore)
         .filter((r) => !remoteOnly || r.is_remote),
-    [results, minScore, remoteOnly]
+    [visibleResults, minScore, remoteOnly]
   );
 
-  if (results.length === 0) {
+  if (results.length === 0 && lowConfidenceResults.length === 0) {
     return (
       <div className="w-full max-w-xl mx-auto text-center py-16">
-        <p className="text-stone-700">No matching jobs found right now.</p>
+        <p className="text-stone-700">No strong AI/ML matches found right now.</p>
         <p className="mt-1 text-sm text-stone-500">The job boards may not have new postings yet — try again in a few hours.</p>
         <button onClick={onReset} className="mt-6 text-teal-700 font-medium hover:underline">
           Try another search
@@ -59,7 +64,7 @@ export default function ResultsTable({ results, jobId, onReset }) {
     <div className="w-full max-w-3xl mx-auto">
       <div className="flex items-center justify-between flex-wrap gap-3">
         <h2 className="text-xl font-semibold text-stone-900">
-          {filtered.length} matching role{filtered.length === 1 ? "" : "s"}
+          {filtered.length} {showBroader ? "broader" : "strong"} match{filtered.length === 1 ? "" : "es"}
         </h2>
         <div className="flex items-center gap-3">
           <a
@@ -79,12 +84,12 @@ export default function ResultsTable({ results, jobId, onReset }) {
 
       <div className="mt-4 flex items-center gap-6 rounded-lg bg-white border border-stone-200 px-4 py-3">
         <label className="flex items-center gap-2 text-sm text-stone-600 flex-1">
-          Min score
+          ATS match
           <input
             type="range"
             min="0"
             max="90"
-            step="10"
+            step="5"
             value={minScore}
             onChange={(e) => setMinScore(Number(e.target.value))}
             className="flex-1 accent-teal-700"
@@ -101,6 +106,26 @@ export default function ResultsTable({ results, jobId, onReset }) {
           Remote only
         </label>
       </div>
+
+      {lowConfidenceResults.length > 0 && (
+        <div className="mt-3">
+          <button
+            onClick={() => {
+              if (!showBroader) setMinScore(0);
+              setShowBroader((value) => !value);
+            }}
+            className="text-sm font-medium text-teal-700 hover:underline"
+          >
+            {showBroader ? "Hide broader low-confidence matches" : "Show broader low-confidence matches"}
+          </button>
+        </div>
+      )}
+
+      {results.length === 0 && lowConfidenceResults.length > 0 && !showBroader && (
+        <div className="w-full max-w-xl mx-auto text-center py-12">
+          <p className="text-stone-700">No strong AI/ML matches found right now.</p>
+        </div>
+      )}
 
       <ul className="mt-4 flex flex-col gap-2">
         {filtered.map((job) => {
@@ -126,6 +151,9 @@ export default function ResultsTable({ results, jobId, onReset }) {
                     {job.company} · {job.location} · {relativeTime(job.date_posted)}
                     {salary ? ` · ${salary}` : ""}
                   </p>
+                  {showBroader && job.exclude_reason && (
+                    <p className="text-xs text-amber-700 truncate">{job.exclude_reason}</p>
+                  )}
                 </div>
 
                 <div className="flex items-center gap-2 shrink-0">

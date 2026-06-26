@@ -6,14 +6,41 @@ The cache decouples user search latency/reliability from live job-board scraping
 from __future__ import annotations
 import json
 import os
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
+from urllib.parse import urlparse
 
 import pandas as pd
 
 from . import config, scraper
+from .sources import ats_sources, google_jobs_serpapi
+
+SOURCE_COUNT_KEYS = [
+    "linkedin_count",
+    "indeed_count",
+    "google_jobs_count",
+    "greenhouse_count",
+    "lever_count",
+    "ashby_count",
+    "workday_count",
+    "company_portal_count",
+    "total_cache_jobs",
+]
+
+SOURCE_PRIORITY = {
+    "greenhouse": 1,
+    "lever": 1,
+    "ashby": 1,
+    "workday": 1,
+    "company_portal": 1,
+    "linkedin": 2,
+    "google_jobs": 3,
+    "google": 3,
+    "indeed": 4,
+}
 
 _DB_PATH = os.environ.get("JOB_CACHE_DB_PATH", "/data/job_cache.db")
 try:
@@ -41,14 +68,27 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
             title        TEXT,
             company      TEXT,
             location     TEXT,
+            source       TEXT,
+            source_type  TEXT,
             site         TEXT,
             description  TEXT,
             date_posted  TEXT,
+            apply_url    TEXT,
             scraped_at   TEXT,
             last_seen_at TEXT,
             raw_json     TEXT
         )
     """)
+    for col, typedef in (
+        ("source", "TEXT"),
+        ("source_type", "TEXT"),
+        ("apply_url", "TEXT"),
+    ):
+        try:
+            con.execute(f"ALTER TABLE jobs_cache ADD COLUMN {col} {typedef}")
+            con.commit()
+        except sqlite3.OperationalError:
+            pass
     con.execute("""
         CREATE TABLE IF NOT EXISTS job_cache_runs (
             id             TEXT PRIMARY KEY,
@@ -58,9 +98,15 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
             raw_count      INTEGER,
             inserted_count INTEGER,
             updated_count  INTEGER,
+            source_counts  TEXT,
             message        TEXT
         )
     """)
+    try:
+        con.execute("ALTER TABLE job_cache_runs ADD COLUMN source_counts TEXT")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass
     con.commit()
 
 
@@ -86,10 +132,132 @@ def _row_value(row, key: str):
     return _json_safe(value)
 
 
+def _empty_source_counts() -> dict:
+    return {key: 0 for key in SOURCE_COUNT_KEYS}
+
+
+def _normal_text(value) -> str:
+    return re.sub(r"\W+", " ", str(value or "").lower()).strip()
+
+
+def _canonical_url(value) -> str:
+    if not value:
+        return ""
+    parsed = urlparse(str(value))
+    return f"{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
+
+
+def _source_priority(row) -> int:
+    source_type = str(row.get("source_type") or row.get("source") or row.get("site") or "").lower()
+    return SOURCE_PRIORITY.get(source_type, 9)
+
+
+def normalize_jobspy_jobs(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    site = df.get("site") if "site" in df.columns else df.get("site_name")
+    df["source"] = site.fillna("jobspy") if site is not None else "jobspy"
+    df["source_type"] = df["source"]
+    if "apply_url" not in df.columns:
+        df["apply_url"] = df.get("job_url")
+    return df
+
+
+def dedupe_prefer_sources(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    for col in ("title", "company", "location", "apply_url", "job_url"):
+        if col not in df.columns:
+            df[col] = ""
+    df["_priority"] = df.apply(_source_priority, axis=1)
+    df["_canonical_apply"] = df["apply_url"].fillna(df["job_url"]).apply(_canonical_url)
+    df["_display_key"] = (
+        df["title"].apply(_normal_text) + "|"
+        + df["company"].apply(_normal_text) + "|"
+        + df["location"].apply(_normal_text)
+    )
+    df = df.sort_values("_priority", ascending=True)
+    with_apply = df[df["_canonical_apply"] != ""].drop_duplicates("_canonical_apply")
+    without_apply = df[df["_canonical_apply"] == ""]
+    df = pd.concat([with_apply, without_apply], ignore_index=True)
+    df = df.sort_values("_priority", ascending=True).drop_duplicates("_display_key")
+    return df.drop(columns=["_priority", "_canonical_apply", "_display_key"]).reset_index(drop=True)
+
+
+def source_counts_from_df(df: pd.DataFrame) -> dict:
+    counts = _empty_source_counts()
+    if df is None or df.empty:
+        return counts
+    source_type = df.get("source_type")
+    source = df.get("source")
+    values = (source_type if source_type is not None else source).fillna("").astype(str).str.lower()
+    counts["linkedin_count"] = int((values == "linkedin").sum())
+    counts["indeed_count"] = int((values == "indeed").sum())
+    counts["google_jobs_count"] = int((values == "google_jobs").sum() + (values == "google").sum())
+    counts["greenhouse_count"] = int((values == "greenhouse").sum())
+    counts["lever_count"] = int((values == "lever").sum())
+    counts["ashby_count"] = int((values == "ashby").sum())
+    counts["workday_count"] = int((values == "workday").sum())
+    counts["company_portal_count"] = int((values == "company_portal").sum())
+    counts["total_cache_jobs"] = int(len(df))
+    return counts
+
+
+def format_source_counts(counts: dict) -> str:
+    return (
+        f"sources linkedin={counts.get('linkedin_count', 0)}, "
+        f"indeed={counts.get('indeed_count', 0)}, "
+        f"google_jobs={counts.get('google_jobs_count', 0)}, "
+        f"greenhouse={counts.get('greenhouse_count', 0)}, "
+        f"lever={counts.get('lever_count', 0)}, "
+        f"ashby={counts.get('ashby_count', 0)}, "
+        f"workday={counts.get('workday_count', 0)}, "
+        f"company_portal={counts.get('company_portal_count', 0)}, "
+        f"total={counts.get('total_cache_jobs', 0)}"
+    )
+
+
+def fetch_jobspy_jobs(location, is_remote, hours_old, on_progress=None, search_terms=None) -> pd.DataFrame:
+    df = scraper.scrape_all(
+        location=location,
+        is_remote=is_remote,
+        hours_old=hours_old,
+        on_progress=on_progress,
+        search_terms=search_terms or config.DEFAULT_STEM_SEARCH_TITLES,
+    )
+    return normalize_jobspy_jobs(df)
+
+
+def fetch_google_jobs(search_terms: list[str], location: str) -> pd.DataFrame:
+    return google_jobs_serpapi.fetch_google_jobs(search_terms, location)
+
+
+def fetch_company_ats_jobs() -> pd.DataFrame:
+    if not config.ENABLE_COMPANY_ATS_SOURCES:
+        return pd.DataFrame()
+    frames = []
+    for fetcher in (
+        ats_sources.fetch_greenhouse_jobs,
+        ats_sources.fetch_lever_jobs,
+        ats_sources.fetch_ashby_jobs,
+        ats_sources.fetch_company_portal_jobs,
+    ):
+        try:
+            df = fetcher()
+            if df is not None and not df.empty:
+                frames.append(df)
+        except Exception:
+            continue
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
 def upsert_jobs(df: pd.DataFrame, scraped_at: str | None = None) -> dict:
     if df is None or df.empty or "job_url" not in df.columns:
         return {"raw_count": 0, "inserted_count": 0, "updated_count": 0}
 
+    df = dedupe_prefer_sources(df)
     now = scraped_at or _iso_now()
     inserted = 0
     updated = 0
@@ -109,9 +277,12 @@ def upsert_jobs(df: pd.DataFrame, scraped_at: str | None = None) -> dict:
                 _row_value(row, "title"),
                 _row_value(row, "company"),
                 _row_value(row, "location"),
+                _row_value(row, "source") or _row_value(row, "site") or _row_value(row, "site_name"),
+                _row_value(row, "source_type") or _row_value(row, "source"),
                 _row_value(row, "site") or _row_value(row, "site_name"),
                 _row_value(row, "description"),
                 _row_value(row, "date_posted"),
+                _row_value(row, "apply_url") or job_url,
                 now,
                 now,
                 json.dumps(raw, default=str),
@@ -119,17 +290,20 @@ def upsert_jobs(df: pd.DataFrame, scraped_at: str | None = None) -> dict:
             con.execute(
                 """
                 INSERT INTO jobs_cache (
-                    job_url, title, company, location, site, description,
-                    date_posted, scraped_at, last_seen_at, raw_json
+                    job_url, title, company, location, source, source_type, site,
+                    description, date_posted, apply_url, scraped_at, last_seen_at, raw_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_url) DO UPDATE SET
                     title = excluded.title,
                     company = excluded.company,
                     location = excluded.location,
+                    source = excluded.source,
+                    source_type = excluded.source_type,
                     site = excluded.site,
                     description = excluded.description,
                     date_posted = excluded.date_posted,
+                    apply_url = excluded.apply_url,
                     last_seen_at = excluded.last_seen_at,
                     raw_json = excluded.raw_json
                 """,
@@ -154,13 +328,16 @@ def refresh_job_cache(
     is_remote: bool = False,
     hours_old: int = config.JOB_CACHE_REFRESH_HOURS,
     on_progress=None,
+    search_terms: list[str] | None = None,
 ) -> dict:
+    empty_counts = _empty_source_counts()
     if not force and not is_cache_stale(config.JOB_CACHE_MAX_AGE_MINUTES) and count_jobs() > 0:
         return {
             "status": "skipped",
             "raw_count": 0,
             "inserted_count": 0,
             "updated_count": 0,
+            "source_counts": empty_counts,
             "message": "cache fresh",
         }
 
@@ -173,17 +350,27 @@ def refresh_job_cache(
         )
         con.commit()
 
+    source_counts = empty_counts
     try:
-        df = scraper.scrape_all(
-            location=location,
-            is_remote=is_remote,
-            hours_old=hours_old,
-            on_progress=on_progress,
-            search_terms=config.DEFAULT_STEM_SEARCH_TITLES,
-        )
+        terms = search_terms or config.DEFAULT_STEM_SEARCH_TITLES
+        frames = []
+        for fetcher in (
+            lambda: fetch_jobspy_jobs(location, is_remote, hours_old, on_progress, terms),
+            lambda: fetch_google_jobs(terms, location),
+            fetch_company_ats_jobs,
+        ):
+            try:
+                frame = fetcher()
+                if frame is not None and not frame.empty:
+                    frames.append(frame)
+            except Exception:
+                continue
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        df = dedupe_prefer_sources(df)
+        source_counts = source_counts_from_df(df)
         counts = upsert_jobs(df, scraped_at=_iso_now())
         status = "done"
-        message = "ok"
+        message = format_source_counts(source_counts)
     except Exception as e:
         counts = {"raw_count": 0, "inserted_count": 0, "updated_count": 0}
         status = "error"
@@ -194,17 +381,17 @@ def refresh_job_cache(
             """
             UPDATE job_cache_runs
             SET finished_at = ?, status = ?, raw_count = ?, inserted_count = ?,
-                updated_count = ?, message = ?
+                updated_count = ?, source_counts = ?, message = ?
             WHERE id = ?
             """,
             (
                 _iso_now(), status, counts["raw_count"], counts["inserted_count"],
-                counts["updated_count"], message, run_id,
+                counts["updated_count"], json.dumps(source_counts), message, run_id,
             ),
         )
         con.commit()
 
-    return {"id": run_id, "status": status, "message": message, **counts}
+    return {"id": run_id, "status": status, "message": message, "source_counts": source_counts, **counts}
 
 
 def get_cache_age_minutes() -> float | None:
@@ -222,6 +409,22 @@ def get_cache_age_minutes() -> float | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - dt).total_seconds() / 60
+
+
+def get_latest_source_counts() -> dict:
+    with _conn() as con:
+        row = con.execute(
+            "SELECT source_counts FROM job_cache_runs WHERE source_counts IS NOT NULL ORDER BY finished_at DESC LIMIT 1"
+        ).fetchone()
+    if not row or not row["source_counts"]:
+        return _empty_source_counts()
+    try:
+        data = json.loads(row["source_counts"])
+    except (TypeError, json.JSONDecodeError):
+        return _empty_source_counts()
+    counts = _empty_source_counts()
+    counts.update({key: int(data.get(key, 0) or 0) for key in SOURCE_COUNT_KEYS})
+    return counts
 
 
 def is_cache_stale(max_age_minutes: int = config.JOB_CACHE_MAX_AGE_MINUTES) -> bool:

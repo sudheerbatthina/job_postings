@@ -46,7 +46,15 @@ def scrape_all(
 ) -> pd.DataFrame:
     terms = search_terms if search_terms is not None else []
     specific = is_specific_location(location)
-    sites = config.SITES if specific else [s for s in config.SITES if s != "glassdoor"]
+    sites = []
+    if config.ENABLE_JOBSPY_LINKEDIN:
+        sites.append("linkedin")
+    sites.append("google")
+    if specific:
+        sites.append("glassdoor")
+    if config.ENABLE_INDEED_FALLBACK:
+        sites.append("indeed")
+    sites = [site for site in sites if site not in config.DISABLED_SOURCES]
     if not specific and on_progress:
         on_progress("Skipping Glassdoor — needs a specific city, not a broad location.")
 

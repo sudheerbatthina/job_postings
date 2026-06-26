@@ -30,6 +30,7 @@ def _conn():
                 text          TEXT,
                 search_titles TEXT,
                 skill_signals TEXT,
+                target_profile TEXT,
                 analysis_version INTEGER DEFAULT 0,
                 total_yoe     INTEGER DEFAULT 0,
                 email         TEXT,
@@ -42,6 +43,7 @@ def _conn():
         for col, typedef in (
             ("search_titles", "TEXT"),
             ("skill_signals", "TEXT"),
+            ("target_profile", "TEXT"),
             ("analysis_version", "INTEGER DEFAULT 0"),
             ("total_yoe", "INTEGER DEFAULT 0"),
         ):
@@ -64,16 +66,17 @@ def save_resume(
     phone: str | None,
     total_yoe: int = 0,
     analysis_version: int = config.RESUME_ANALYSIS_VERSION,
+    target_profile: str | None = None,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as con:
         con.execute("DELETE FROM resume")
         con.execute(
             "INSERT INTO resume "
-            "(filename, text, search_titles, skill_signals, analysis_version, total_yoe, email, phone, stored_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(filename, text, search_titles, skill_signals, target_profile, analysis_version, total_yoe, email, phone, stored_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                filename, text, search_titles, skill_signals, analysis_version,
+                filename, text, search_titles, skill_signals, target_profile, analysis_version,
                 total_yoe, email, phone, now,
             ),
         )

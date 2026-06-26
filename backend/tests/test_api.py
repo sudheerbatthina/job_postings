@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main, resume_parser, scraper as scraper_mod
+from app.sources import ats_sources, google_jobs_serpapi
 
 
 @pytest.fixture(autouse=True)
@@ -173,8 +174,7 @@ def test_unknown_job_returns_404(client):
 
 
 def test_results_sorted_by_ats_score(monkeypatch):
-    """Results must be sorted descending by ats_score even when scores are low
-    (i.e. below what used to be the 75/50 thresholds that no longer exist)."""
+    """Low-score jobs should be separated from default strong-match results."""
 
     def low_score_claude(df, resume_text, skill_signals, total_yoe, client, *args):
         if df.empty:
@@ -212,10 +212,12 @@ def test_results_sorted_by_ats_score(monkeypatch):
 
         assert body["status"] == "done", body
         results = body["results"]
-        assert len(results) >= 2, f"both jobs should appear with no score threshold, got {len(results)}"
-        assert results[0]["ats_score"] == 45
-        assert results[1]["ats_score"] == 30
-        assert results[0]["title"] == "Senior AI Engineer"
+        low_confidence = body["low_confidence_results"]
+        assert results == []
+        assert len(low_confidence) >= 2
+        assert low_confidence[0]["ats_score"] == 45
+        assert low_confidence[1]["ats_score"] == 30
+        assert low_confidence[0]["title"] == "Senior AI Engineer"
 
 
 def test_resume_reuse(monkeypatch):
@@ -554,6 +556,8 @@ def test_scraper_never_runs_with_empty_search_titles(monkeypatch, tmp_path):
 
     monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
     monkeypatch.setattr(main.job_cache.scraper, "scrape_all", capture_terms)
+    monkeypatch.setattr(main.job_cache, "fetch_google_jobs", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(main.job_cache, "fetch_company_ats_jobs", lambda: pd.DataFrame())
     result = main.job_cache.refresh_job_cache(force=True, location="United States", is_remote=False)
 
     assert result["status"] == "done"
@@ -608,6 +612,8 @@ def test_stale_cache_refreshes_with_broad_stem_titles(monkeypatch, tmp_path):
 
     monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
     monkeypatch.setattr(main.job_cache.scraper, "scrape_all", capture_scrape)
+    monkeypatch.setattr(main.job_cache, "fetch_google_jobs", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(main.job_cache, "fetch_company_ats_jobs", lambda: pd.DataFrame())
 
     assert main.job_cache.is_cache_stale()
     result = main.job_cache.refresh_job_cache(force=False, location="United States", is_remote=False)
@@ -617,6 +623,210 @@ def test_stale_cache_refreshes_with_broad_stem_titles(monkeypatch, tmp_path):
     assert main.job_cache.count_jobs() == 3
     assert main.job_cache.get_cache_age_minutes() is not None
     assert captured_terms == [main.config.DEFAULT_STEM_SEARCH_TITLES]
+
+
+def test_greenhouse_lever_ashby_google_job_normalization():
+    greenhouse = ats_sources.normalize_greenhouse_job({
+        "title": "Applied AI Engineer",
+        "absolute_url": "https://boards.greenhouse.io/acme/jobs/1",
+        "location": {"name": "Remote"},
+        "content": "<p>Build LLM RAG systems.</p>",
+        "updated_at": "2026-06-26T12:00:00Z",
+    }, "Acme", "acme")
+    lever = ats_sources.normalize_lever_job({
+        "text": "ML Engineer",
+        "hostedUrl": "https://jobs.lever.co/acme/2",
+        "categories": {"location": "New York, NY"},
+        "lists": [{"content": "<div>Deploy ML models.</div>"}],
+    }, "Acme")
+    ashby = ats_sources.normalize_ashby_job({
+        "title": "GenAI Engineer",
+        "jobUrl": "https://jobs.ashbyhq.com/acme/3",
+        "locationName": "Remote - US",
+        "descriptionHtml": "<p>Build agentic AI applications.</p>",
+    }, "Acme")
+    google = google_jobs_serpapi.normalize_google_job({
+        "title": "LLM Engineer",
+        "company_name": "Acme",
+        "location": "Remote",
+        "description": "RAG and vector search",
+        "apply_options": [{"link": "https://acme.com/jobs/4"}],
+    }, "LLM Engineer")
+
+    assert greenhouse["source_type"] == "greenhouse"
+    assert greenhouse["is_remote"] is True
+    assert "Build LLM RAG" in greenhouse["description"]
+    assert lever["source_type"] == "lever"
+    assert lever["job_url"] == "https://jobs.lever.co/acme/2"
+    assert ashby["source_type"] == "ashby"
+    assert ashby["is_remote"] is True
+    assert google["source_type"] == "google_jobs"
+    assert google["apply_url"] == "https://acme.com/jobs/4"
+
+
+def test_source_counts_are_stored_on_cache_refresh(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
+    jobspy = pd.DataFrame([
+        {
+            "title": "AI Engineer",
+            "company": "LinkedCo",
+            "location": "Remote",
+            "source": "linkedin",
+            "source_type": "linkedin",
+            "job_url": "http://linkedin/1",
+            "description": "LLM RAG",
+        },
+        {
+            "title": "ML Engineer",
+            "company": "IndeedCo",
+            "location": "Remote",
+            "source": "indeed",
+            "source_type": "indeed",
+            "job_url": "http://indeed/2",
+            "description": "ML systems",
+        },
+    ])
+    google = pd.DataFrame([{
+        "title": "GenAI Engineer",
+        "company": "GoogleJobsCo",
+        "location": "Remote",
+        "source": "google_jobs",
+        "source_type": "google_jobs",
+        "job_url": "http://googlejobs/3",
+        "description": "GenAI",
+    }])
+    ats = pd.DataFrame([
+        {
+            "title": "Applied AI Engineer",
+            "company": "GreenCo",
+            "location": "Remote",
+            "source": "greenhouse",
+            "source_type": "greenhouse",
+            "job_url": "http://greenhouse/4",
+            "apply_url": "http://greenhouse/4",
+            "description": "Applied AI",
+        },
+        {
+            "title": "LLM Engineer",
+            "company": "LeverCo",
+            "location": "Remote",
+            "source": "lever",
+            "source_type": "lever",
+            "job_url": "http://lever/5",
+            "apply_url": "http://lever/5",
+            "description": "LLM",
+        },
+    ])
+
+    monkeypatch.setattr(main.job_cache, "fetch_jobspy_jobs", lambda *args, **kwargs: jobspy)
+    monkeypatch.setattr(main.job_cache, "fetch_google_jobs", lambda *args, **kwargs: google)
+    monkeypatch.setattr(main.job_cache, "fetch_company_ats_jobs", lambda: ats)
+
+    result = main.job_cache.refresh_job_cache(force=True)
+    counts = result["source_counts"]
+
+    assert result["status"] == "done"
+    assert counts["linkedin_count"] == 1
+    assert counts["indeed_count"] == 1
+    assert counts["google_jobs_count"] == 1
+    assert counts["greenhouse_count"] == 1
+    assert counts["lever_count"] == 1
+    assert counts["total_cache_jobs"] == 5
+    assert main.job_cache.get_latest_source_counts()["greenhouse_count"] == 1
+
+
+def test_direct_ats_url_wins_over_indeed_duplicate():
+    df = pd.DataFrame([
+        {
+            "title": "Applied AI Engineer",
+            "company": "Acme",
+            "location": "Remote",
+            "source": "indeed",
+            "source_type": "indeed",
+            "job_url": "https://indeed.com/viewjob?jk=1",
+            "apply_url": "https://indeed.com/viewjob?jk=1",
+        },
+        {
+            "title": "Applied AI Engineer",
+            "company": "Acme",
+            "location": "Remote",
+            "source": "greenhouse",
+            "source_type": "greenhouse",
+            "job_url": "https://boards.greenhouse.io/acme/jobs/1",
+            "apply_url": "https://boards.greenhouse.io/acme/jobs/1",
+        },
+    ])
+
+    deduped = main.job_cache.dedupe_prefer_sources(df)
+    assert len(deduped) == 1
+    assert deduped.iloc[0]["source_type"] == "greenhouse"
+
+
+def test_source_failure_does_not_fail_full_cache_refresh(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
+
+    def failing_jobspy(*args, **kwargs):
+        raise RuntimeError("linkedin rate limited")
+
+    ats = pd.DataFrame([{
+        "title": "Applied AI Engineer",
+        "company": "GreenCo",
+        "location": "Remote",
+        "source": "greenhouse",
+        "source_type": "greenhouse",
+        "job_url": "http://greenhouse/fallback",
+        "description": "LLM RAG",
+    }])
+    monkeypatch.setattr(main.job_cache, "fetch_jobspy_jobs", failing_jobspy)
+    monkeypatch.setattr(main.job_cache, "fetch_google_jobs", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(main.job_cache, "fetch_company_ats_jobs", lambda: ats)
+
+    result = main.job_cache.refresh_job_cache(force=True)
+    assert result["status"] == "done"
+    assert result["raw_count"] == 1
+    assert result["source_counts"]["greenhouse_count"] == 1
+
+
+def test_cache_refresh_not_dominated_by_indeed_when_ats_returns_jobs(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.job_cache, "_DB_PATH", str(tmp_path / "job_cache.db"))
+    indeed = pd.DataFrame([{
+        "title": "AI Engineer",
+        "company": "IndeedOnly",
+        "location": "Remote",
+        "source": "indeed",
+        "source_type": "indeed",
+        "job_url": "http://indeed/only",
+        "description": "AI",
+    }])
+    ats = pd.DataFrame([
+        {
+            "title": "Applied AI Engineer",
+            "company": "GreenCo",
+            "location": "Remote",
+            "source": "greenhouse",
+            "source_type": "greenhouse",
+            "job_url": "http://greenhouse/1",
+            "description": "LLM",
+        },
+        {
+            "title": "ML Engineer",
+            "company": "LeverCo",
+            "location": "Remote",
+            "source": "lever",
+            "source_type": "lever",
+            "job_url": "http://lever/2",
+            "description": "ML",
+        },
+    ])
+    monkeypatch.setattr(main.job_cache, "fetch_jobspy_jobs", lambda *args, **kwargs: indeed)
+    monkeypatch.setattr(main.job_cache, "fetch_google_jobs", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(main.job_cache, "fetch_company_ats_jobs", lambda: ats)
+
+    result = main.job_cache.refresh_job_cache(force=True)
+    counts = result["source_counts"]
+    assert counts["indeed_count"] == 1
+    assert counts["greenhouse_count"] + counts["lever_count"] == 2
+    assert counts["indeed_count"] < counts["total_cache_jobs"]
 
 
 def test_user_run_uses_cached_jobs_instead_of_live_scraper(monkeypatch):
@@ -730,6 +940,217 @@ def test_scoring_failure_returns_fallback_ranked_jobs(monkeypatch):
     assert len(body["results"]) >= 1
     assert all("ats_score" in row for row in body["results"])
     assert "fallback scoring used" in body["message"]
+
+
+def test_role_relevance_gate_for_applied_ai_targets():
+    profile = main.config.DEFAULT_TARGET_PROFILE
+    cases = [
+        (
+            {
+                "title": "Applied AI Engineer",
+                "description": "Build LLM RAG systems with embeddings, vector search, Python, and MLOps.",
+            },
+            False,
+            "applied_ai_ml",
+        ),
+        (
+            {
+                "title": "GenAI Engineer",
+                "description": "Deploy agentic AI workflows and LLM applications with LangChain.",
+            },
+            False,
+            "applied_ai_ml",
+        ),
+        (
+            {
+                "title": "ML Engineer",
+                "description": "Train and deploy machine learning models with PyTorch and model serving.",
+            },
+            False,
+            "applied_ai_ml",
+        ),
+        (
+            {
+                "title": "Data Engineer",
+                "description": "Build SQL ETL pipelines and dashboards for finance reporting.",
+            },
+            True,
+            "data_engineering",
+        ),
+        (
+            {
+                "title": "Data Engineer",
+                "description": "Build feature engineering pipelines, vector search, and MLOps model deployment.",
+            },
+            False,
+            "data_engineering",
+        ),
+        (
+            {
+                "title": "Pharma Technology Consultant Manager",
+                "description": "Lead client advisory teams and technology transformation programs.",
+            },
+            True,
+            "consulting",
+        ),
+        (
+            {
+                "title": "Splunk Engineer",
+                "description": "Own observability dashboards, alerts, and admin operations.",
+            },
+            True,
+            "infra_admin",
+        ),
+    ]
+
+    for job, excluded, family in cases:
+        result = main.scoring.classify_job_relevance(job, profile)
+        assert result["exclude_by_default"] is excluded, (job, result)
+        assert result["job_family"] == family
+
+
+def test_duplicate_title_company_location_is_deduped():
+    df = pd.DataFrame([
+        {
+            "title": "Pharma Technology Consultant Manager",
+            "company": "PwC",
+            "location": "New York, NY",
+            "job_url": "http://dup/1",
+        },
+        {
+            "title": "Pharma Technology Consultant Manager",
+            "company": "PWC",
+            "location": "New York NY",
+            "job_url": "http://dup/2",
+        },
+        {
+            "title": "Applied AI Engineer",
+            "company": "Acme",
+            "location": "Remote",
+            "job_url": "http://dup/3",
+        },
+    ])
+
+    deduped = main.scoring.dedupe_display_jobs(df)
+    assert len(deduped) == 2
+    assert "http://dup/1" in set(deduped["job_url"])
+    assert "http://dup/3" in set(deduped["job_url"])
+
+
+def test_pipeline_separates_strong_and_low_confidence_matches(monkeypatch):
+    jobs = pd.DataFrame([
+        {
+            "title": "Applied AI Engineer",
+            "company": "Acme",
+            "location": "Remote",
+            "date_posted": date.today(),
+            "is_remote": True,
+            "job_url": "http://rel/ai",
+            "description": "Build LLM RAG systems with embeddings vector search Python MLOps.",
+        },
+        {
+            "title": "Data Engineer",
+            "company": "PipelinesCo",
+            "location": "Remote",
+            "date_posted": date.today(),
+            "is_remote": True,
+            "job_url": "http://rel/de",
+            "description": "Build SQL ETL pipelines and warehouse models for dashboards.",
+        },
+        {
+            "title": "Pharma Technology Consultant Manager",
+            "company": "PwC",
+            "location": "New York, NY",
+            "date_posted": date.today(),
+            "is_remote": False,
+            "job_url": "http://rel/pharma",
+            "description": "Lead advisory technology transformation for pharma clients.",
+        },
+    ])
+
+    def score_by_title(df, resume_text, skill_signals, total_yoe, client, *args):
+        df = df.copy()
+        scores = {"http://rel/ai": 82, "http://rel/de": 85, "http://rel/pharma": 90}
+        df["ats_score"] = df["job_url"].map(scores).fillna(20).astype(int)
+        df["missing_keywords"] = [[] for _ in range(len(df))]
+        return df
+
+    _install_cache_fakes(monkeypatch, get_recent_jobs=lambda hours_old: jobs, count_jobs=len(jobs))
+    monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
+    monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
+    monkeypatch.setattr(main.resume_parser, "extract_keywords", lambda text, client: _FAKE_KW)
+    monkeypatch.setattr(main.scoring, "score_with_claude", score_by_title)
+
+    with TestClient(main.app) as c:
+        r = c.post(
+            "/api/analyze",
+            files={"resume": ("resume.txt", b"Applied AI LLM RAG MLOps Python", "text/plain")},
+            data={"location": "United States", "is_remote": "false", "hours_old": "24"},
+        )
+        assert r.status_code == 200, r.text
+        body = _wait_for_done(c, r.json()["job_id"])
+
+    assert body["status"] == "done", body
+    assert [row["job_url"] for row in body["results"]] == ["http://rel/ai"]
+    low_urls = {row["job_url"] for row in body["low_confidence_results"]}
+    assert "http://rel/de" in low_urls
+    assert "http://rel/pharma" in low_urls
+    assert "strong AI/ML" in body["message"]
+
+
+def test_seen_logic_marks_only_strong_displayed_jobs(monkeypatch):
+    marked_urls = []
+    jobs = pd.DataFrame([
+        {
+            "title": "Applied AI Engineer",
+            "company": "Acme",
+            "location": "Remote",
+            "date_posted": date.today(),
+            "is_remote": True,
+            "job_url": "http://seen/ai",
+            "description": "Build LLM RAG systems with embeddings vector search Python MLOps.",
+        },
+        {
+            "title": "Splunk Engineer",
+            "company": "OpsCo",
+            "location": "Remote",
+            "date_posted": date.today(),
+            "is_remote": True,
+            "job_url": "http://seen/splunk",
+            "description": "Splunk observability dashboards alerts and administration.",
+        },
+    ])
+
+    def fake_mark_seen(df, resume_hash=None):
+        marked_urls.extend(df["job_url"].tolist())
+
+    _install_cache_fakes(monkeypatch, get_recent_jobs=lambda hours_old: jobs, count_jobs=len(jobs))
+    monkeypatch.setattr(main.dedup, "mark_seen", fake_mark_seen)
+    monkeypatch.setattr(main.resume_store, "load_resume", lambda: None)
+    monkeypatch.setattr(main.resume_store, "save_resume", lambda **kw: None)
+    monkeypatch.setattr(main.resume_parser, "extract_keywords", lambda text, client: _FAKE_KW)
+    monkeypatch.setattr(main.scoring, "score_with_claude", _fake_score_with_claude)
+
+    with TestClient(main.app) as c:
+        r = c.post(
+            "/api/analyze",
+            files={"resume": ("resume.txt", b"Applied AI LLM RAG MLOps Python", "text/plain")},
+            data={"location": "United States", "is_remote": "false", "hours_old": "24"},
+        )
+        assert r.status_code == 200, r.text
+        body = _wait_for_done(c, r.json()["job_id"])
+
+    assert body["status"] == "done", body
+    assert marked_urls == ["http://seen/ai"]
+
+
+def test_frontend_default_min_score_is_65():
+    source = (main.__file__)
+    frontend_path = source.split("backend")[0] + "frontend/src/components/ResultsTable.jsx"
+    with open(frontend_path, encoding="utf-8") as f:
+        text = f.read()
+    assert "useState(65)" in text
+    assert "ATS match" in text
 
 
 def test_glassdoor_location_filtering(monkeypatch):

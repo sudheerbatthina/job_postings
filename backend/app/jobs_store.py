@@ -25,6 +25,7 @@ def create_job() -> str:
         "status": "pending",
         "message": "Queued",
         "results": None,
+        "low_confidence_results": None,
         "error": None,
         "created_at": time.time(),
         "_df": None,  # holds the ranked DataFrame for the xlsx export endpoint
@@ -55,14 +56,29 @@ def _sanitize_record(record: dict) -> dict:
     return {k: _sanitize(v) for k, v in record.items()}
 
 
-def set_results(job_id: str, df: pd.DataFrame, message: str | None = None) -> None:
+def set_results(
+    job_id: str,
+    df: pd.DataFrame,
+    message: str | None = None,
+    low_confidence_df: pd.DataFrame | None = None,
+) -> None:
     records = df.drop(columns=[c for c in ["kw_score", "resume_match"] if c in df.columns], errors="ignore")
     records = records.where(pd.notnull(records), None)
+    low_df = low_confidence_df if low_confidence_df is not None else pd.DataFrame()
+    low_records = low_df.drop(
+        columns=[c for c in ["kw_score", "resume_match"] if c in low_df.columns],
+        errors="ignore",
+    )
+    if not low_records.empty:
+        low_records = low_records.where(pd.notnull(low_records), None)
     update_job(
         job_id,
         status="done",
         message=message or f"Found {len(df)} matching jobs",
         results=[_sanitize_record(r) for r in records.to_dict(orient="records")],
+        low_confidence_results=[
+            _sanitize_record(r) for r in low_records.to_dict(orient="records")
+        ],
         _df=df,
     )
 

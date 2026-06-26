@@ -23,8 +23,9 @@ except OSError:
     _DB_PATH = "./seen_jobs.db"
 
 
-def resume_hash(resume_text: str) -> str:
-    return hashlib.sha256((resume_text or "").encode("utf-8")).hexdigest()
+def resume_hash(resume_text: str, primary_track: str | None = None) -> str:
+    basis = f"{primary_track or 'default'}\n{resume_text or ''}"
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
 @contextmanager
