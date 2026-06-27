@@ -66,7 +66,7 @@ function applySort(jobs, sortBy) {
 export default function ResultsTable({ results, lowConfidenceResults = [], jobId, onReset }) {
   const [minScore, setMinScore] = useState(65);
   const [remoteOnly, setRemoteOnly] = useState(false);
-  const [sortBy, setSortBy] = useState("recommended");
+  const [sortBy, setSortBy] = useState("most_recent");
   const [expandedUrl, setExpandedUrl] = useState(null);
   const [showBroader, setShowBroader] = useState(false);
   const visibleResults = useMemo(

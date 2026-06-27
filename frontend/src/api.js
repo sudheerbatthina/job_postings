@@ -1,11 +1,20 @@
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
-export async function submitResume({ file, location, isRemote, resultLimit = 10 }) {
+export async function submitResume({
+  file,
+  location,
+  isRemote,
+  resultLimit = 10,
+  sortMode = "most_recent",
+  freshnessWindowMinutes = 10,
+}) {
   const form = new FormData();
   if (file) form.append("resume", file);
   form.append("location", location);
   form.append("is_remote", isRemote);
   form.append("result_limit", resultLimit);
+  form.append("sort_mode", sortMode);
+  form.append("freshness_window_minutes", freshnessWindowMinutes);
 
   const res = await fetch(`${API_URL}/api/analyze`, { method: "POST", body: form });
   if (!res.ok) {

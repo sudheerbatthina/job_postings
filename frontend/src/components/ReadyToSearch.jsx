@@ -5,12 +5,14 @@ export default function ReadyToSearch({ storedResume, onSubmit, onReplace }) {
   const [location, setLocation] = useState("United States");
   const [isRemote, setIsRemote] = useState(false);
   const [resultLimit, setResultLimit] = useState(10);
+  const [sortMode, setSortMode] = useState("most_recent");
+  const [freshnessWindowMinutes, setFreshnessWindowMinutes] = useState(10);
 
   const searchTitles = storedResume?.search_titles || [];
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    onSubmit({ location, isRemote, resultLimit });
+    onSubmit({ location, isRemote, resultLimit, sortMode, freshnessWindowMinutes });
   };
 
   return (
@@ -69,6 +71,31 @@ export default function ReadyToSearch({ storedResume, onSubmit, onReplace }) {
             <option value={10}>10 jobs</option>
             <option value={20}>20 jobs</option>
             <option value={30}>30 jobs</option>
+          </select>
+        </label>
+        <label className="flex flex-col gap-1.5">
+          <span className="text-sm font-medium text-stone-700">Freshness</span>
+          <select
+            value={freshnessWindowMinutes}
+            onChange={(e) => setFreshnessWindowMinutes(Number(e.target.value))}
+            className="rounded-lg border border-stone-300 px-3 py-2 text-stone-900 focus:outline-none focus:ring-2 focus:ring-teal-700/40 focus:border-teal-700"
+          >
+            <option value={10}>Last 10 minutes</option>
+            <option value={60}>Last 1 hour</option>
+            <option value={360}>Last 6 hours</option>
+            <option value={1800}>Last 30 hours</option>
+          </select>
+        </label>
+        <label className="flex flex-col gap-1.5">
+          <span className="text-sm font-medium text-stone-700">Sort</span>
+          <select
+            value={sortMode}
+            onChange={(e) => setSortMode(e.target.value)}
+            className="rounded-lg border border-stone-300 px-3 py-2 text-stone-900 focus:outline-none focus:ring-2 focus:ring-teal-700/40 focus:border-teal-700"
+          >
+            <option value="most_recent">Most Recent</option>
+            <option value="top_matched">Top Matched</option>
+            <option value="recommended">Recommended</option>
           </select>
         </label>
       </div>

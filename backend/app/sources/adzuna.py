@@ -110,6 +110,7 @@ def fetch_adzuna_jobs(
                         "app_id": app_id,
                         "app_key": app_key,
                         "what": term,
+                        "sort_by": "date",
                         "results_per_page": config.ADZUNA_RESULTS_PER_PAGE,
                         "content-type": "application/json",
                     },
@@ -136,4 +137,8 @@ def fetch_adzuna_jobs(
                 break
         logger.info("adzuna query=%r raw_count=%s normalized_count=%s", term, term_raw, term_rows)
     logger.info("adzuna total_normalized_count=%s", len(rows))
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if not df.empty and "posted_at_ts" in df.columns:
+        df["_posted_sort"] = pd.to_datetime(df["posted_at_ts"], errors="coerce", utc=True)
+        df = df.sort_values("_posted_sort", ascending=False, na_position="last").drop(columns=["_posted_sort"])
+    return df.reset_index(drop=True)

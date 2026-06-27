@@ -7,6 +7,8 @@ export default function UploadForm({ onSubmit }) {
   const [location, setLocation] = useState("United States");
   const [isRemote, setIsRemote] = useState(false);
   const [resultLimit, setResultLimit] = useState(10);
+  const [sortMode, setSortMode] = useState("most_recent");
+  const [freshnessWindowMinutes, setFreshnessWindowMinutes] = useState(10);
 
   const onDrop = useCallback((accepted) => {
     if (accepted[0]) setFile(accepted[0]);
@@ -25,7 +27,7 @@ export default function UploadForm({ onSubmit }) {
   const handleSubmit = (e) => {
     e.preventDefault();
     if (!file) return;
-    onSubmit({ file, location, isRemote, resultLimit });
+    onSubmit({ file, location, isRemote, resultLimit, sortMode, freshnessWindowMinutes });
   };
 
   return (
@@ -39,7 +41,7 @@ export default function UploadForm({ onSubmit }) {
         rank each match using AI.
       </p>
       <p className="mt-1 text-sm text-stone-400">
-        Searches recent postings from the last 30 hours.
+        Searches live sources for the freshest postings first.
       </p>
 
       <div
@@ -92,6 +94,31 @@ export default function UploadForm({ onSubmit }) {
             <option value={10}>10 jobs</option>
             <option value={20}>20 jobs</option>
             <option value={30}>30 jobs</option>
+          </select>
+        </label>
+        <label className="flex flex-col gap-1.5">
+          <span className="text-sm font-medium text-stone-700">Freshness</span>
+          <select
+            value={freshnessWindowMinutes}
+            onChange={(e) => setFreshnessWindowMinutes(Number(e.target.value))}
+            className="rounded-lg border border-stone-300 px-3 py-2 text-stone-900 focus:outline-none focus:ring-2 focus:ring-teal-700/40 focus:border-teal-700"
+          >
+            <option value={10}>Last 10 minutes</option>
+            <option value={60}>Last 1 hour</option>
+            <option value={360}>Last 6 hours</option>
+            <option value={1800}>Last 30 hours</option>
+          </select>
+        </label>
+        <label className="flex flex-col gap-1.5">
+          <span className="text-sm font-medium text-stone-700">Sort</span>
+          <select
+            value={sortMode}
+            onChange={(e) => setSortMode(e.target.value)}
+            className="rounded-lg border border-stone-300 px-3 py-2 text-stone-900 focus:outline-none focus:ring-2 focus:ring-teal-700/40 focus:border-teal-700"
+          >
+            <option value="most_recent">Most Recent</option>
+            <option value="top_matched">Top Matched</option>
+            <option value="recommended">Recommended</option>
           </select>
         </label>
       </div>

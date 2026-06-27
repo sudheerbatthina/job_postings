@@ -1,6 +1,7 @@
 """Google Jobs ingestion through SerpAPI."""
 
 from __future__ import annotations
+import logging
 import os
 from datetime import datetime, timezone
 
@@ -9,6 +10,8 @@ import requests
 
 from .. import config
 from .. import freshness
+
+logger = logging.getLogger(__name__)
 
 
 def _first_apply_link(job: dict) -> str | None:
@@ -65,29 +68,50 @@ def fetch_google_jobs(
     location: str = "United States",
     api_key: str | None = None,
     timeout: int = config.SOURCE_REQUEST_TIMEOUT_SECONDS,
+    no_cache: bool | None = None,
+    pages_per_query: int | None = None,
 ) -> pd.DataFrame:
     api_key = api_key or os.environ.get("SERPAPI_API_KEY")
     if not api_key or not config.ENABLE_SERPAPI_GOOGLE_JOBS:
         return pd.DataFrame()
 
+    no_cache = config.LIVE_FRESH_SEARCH if no_cache is None else bool(no_cache)
+    pages_per_query = pages_per_query or config.SERPAPI_PAGES_PER_QUERY
     rows: list[dict] = []
     for term in search_terms:
-        params = {
-            "engine": "google_jobs",
-            "q": term,
-            "location": location,
-            "api_key": api_key,
-        }
-        try:
-            resp = requests.get("https://serpapi.com/search.json", params=params, timeout=timeout)
-            resp.raise_for_status()
-            payload = resp.json()
-        except Exception:
-            continue
-        for job in payload.get("jobs_results", []) or []:
-            if isinstance(job, dict):
-                scraped_at = datetime.now(timezone.utc)
-                row = normalize_google_job(job, term, scraped_at)
-                row["scraped_at"] = scraped_at.isoformat()
-                rows.append(row)
+        next_page_token = None
+        term_raw = 0
+        term_rows = 0
+        for page in range(1, pages_per_query + 1):
+            params = {
+                "engine": "google_jobs",
+                "q": term,
+                "location": location,
+                "api_key": api_key,
+            }
+            if no_cache:
+                params["no_cache"] = "true"
+            if next_page_token:
+                params["next_page_token"] = next_page_token
+            try:
+                resp = requests.get("https://serpapi.com/search.json", params=params, timeout=timeout)
+                logger.info("serpapi google_jobs query=%r page=%s status=%s no_cache=%s", term, page, resp.status_code, no_cache)
+                resp.raise_for_status()
+                payload = resp.json()
+            except Exception as e:
+                logger.warning("serpapi google_jobs query=%r page=%s failed: %s", term, page, e)
+                continue
+            page_results = payload.get("jobs_results", []) or []
+            term_raw += len(page_results)
+            scraped_at = datetime.now(timezone.utc)
+            for job in page_results:
+                if isinstance(job, dict):
+                    row = normalize_google_job(job, term, scraped_at)
+                    row["scraped_at"] = scraped_at.isoformat()
+                    rows.append(row)
+                    term_rows += 1
+            next_page_token = (payload.get("serpapi_pagination") or {}).get("next_page_token")
+            if not next_page_token:
+                break
+        logger.info("serpapi google_jobs query=%r raw_count=%s normalized_count=%s", term, term_raw, term_rows)
     return pd.DataFrame(rows)

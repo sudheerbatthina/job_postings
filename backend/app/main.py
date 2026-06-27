@@ -14,13 +14,14 @@ import json
 import logging
 import os
 import re
+from datetime import timezone
 
 logger = logging.getLogger(__name__)
 
 import anthropic
 import pandas as pd
 import requests as _requests
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -28,6 +29,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from . import config, freshness, jobs_store, resume_parser, resume_store, scoring, export, dedup, job_cache
+from .sources import adzuna, arbeitnow, google_jobs_serpapi
 
 # ---------------------------------------------------------------------------
 # App + rate limiter
@@ -100,6 +102,8 @@ async def analyze(
     hours_old: int = Form(config.DEFAULT_HOURS_OLD),
     result_limit: str | None = Form(None),
     top_results: str | None = Form(None),
+    sort_mode: str = Form(config.DEFAULT_SORT_MODE),
+    freshness_window_minutes: str | None = Form(None),
 ):
     if resume is not None:
         content: bytes | None = await resume.read()
@@ -116,8 +120,10 @@ async def analyze(
 
     job_id = jobs_store.create_job()
     limit = _validate_result_limit(result_limit if result_limit is not None else top_results)
+    sort_mode = _validate_sort_mode(sort_mode)
+    freshness_window = _validate_freshness_window(freshness_window_minutes)
     asyncio.create_task(
-        _run_analysis(job_id, filename, content, location, is_remote, hours_old, limit)
+        _run_analysis(job_id, filename, content, location, is_remote, hours_old, limit, sort_mode, freshness_window)
     )
     return {"job_id": job_id}
 
@@ -139,6 +145,42 @@ def get_status(job_id: str):
 @app.get("/api/cache/debug")
 def cache_debug():
     return job_cache.get_cache_debug()
+
+
+@app.get("/api/live/debug")
+async def live_debug(
+    freshness_window_minutes: int = Query(config.PRIMARY_FRESH_WINDOW_MINUTES),
+    location: str = Query("United States"),
+    is_remote: bool = Query(False),
+):
+    freshness_window = _validate_freshness_window(freshness_window_minutes)
+    frames = await asyncio.to_thread(
+        _fetch_live_source_frames,
+        location,
+        is_remote,
+        config.LIVE_SEARCH_TITLES,
+        None,
+    )
+    raw_df = _combine_frames(frames)
+    normalized = _prepare_live_jobs(raw_df)
+    newest = scoring.sort_unscored_recent(normalized).head(10) if not normalized.empty else pd.DataFrame()
+    latest_by_source = {}
+    if not normalized.empty and "source_type" in normalized.columns:
+        posted = pd.to_datetime(normalized.get("posted_at_ts"), errors="coerce", utc=True)
+        temp = normalized.assign(_posted=posted)
+        for source, group in temp.groupby(temp["source_type"].fillna("unknown")):
+            if group["_posted"].notna().any():
+                latest_by_source[str(source)] = group["_posted"].max().isoformat()
+    return {
+        "live_fresh_search": config.LIVE_FRESH_SEARCH,
+        "job_cache_used": False,
+        "freshness_window_minutes": freshness_window,
+        "source_counts": job_cache.source_counts_from_df(raw_df),
+        "normalized_source_counts": job_cache.source_counts_from_df(normalized),
+        "latest_posted_at_ts_by_source": latest_by_source,
+        "newest_jobs": _df_records(newest),
+        "sources": _live_source_status(),
+    }
 
 
 @app.get("/api/analyze/{job_id}/export.xlsx")
@@ -179,6 +221,37 @@ def _validate_result_limit(value) -> int:
     if limit in config.ALLOWED_RESULT_LIMITS:
         return limit
     return config.DEFAULT_RESULT_LIMIT
+
+
+def _validate_sort_mode(value: str | None) -> str:
+    if value in config.ALLOWED_SORT_MODES:
+        return str(value)
+    return config.DEFAULT_SORT_MODE
+
+
+def _validate_freshness_window(value) -> int:
+    if value is None or value == "":
+        return config.PRIMARY_FRESH_WINDOW_MINUTES
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return config.PRIMARY_FRESH_WINDOW_MINUTES
+    if minutes in config.ALLOWED_FRESHNESS_WINDOWS_MINUTES:
+        return minutes
+    return config.PRIMARY_FRESH_WINDOW_MINUTES
+
+
+def _window_label(minutes: int) -> str:
+    if minutes < 60:
+        return f"{minutes} min"
+    hours = minutes // 60
+    return f"{hours} hr" if hours == 1 else f"{hours} hr"
+
+
+def _df_records(df: pd.DataFrame) -> list[dict]:
+    if df is None or df.empty:
+        return []
+    return json.loads(df.where(pd.notna(df), None).to_json(orient="records", date_format="iso"))
 
 
 def _cache_analysis_version(stored: dict | None) -> int:
@@ -249,6 +322,83 @@ def _source_count_lines(counts: dict) -> list[str]:
     ]
 
 
+def _live_source_status() -> dict:
+    return {
+        "jobspy": {"enabled": True, "credential_present": True},
+        "serpapi_google_jobs": {
+            "enabled": config.ENABLE_SERPAPI_GOOGLE_JOBS,
+            "credential_present": bool(os.environ.get("SERPAPI_API_KEY")),
+        },
+        "arbeitnow": {"enabled": config.ENABLE_ARBEITNOW, "credential_present": True},
+        "adzuna": {
+            "enabled": config.ENABLE_ADZUNA,
+            "app_id_present": bool(os.environ.get("ADZUNA_APP_ID")),
+            "app_key_present": bool(os.environ.get("ADZUNA_APP_KEY")),
+        },
+        "company_ats": {"enabled": config.ENABLE_COMPANY_ATS_SOURCES, "credential_present": True},
+    }
+
+
+def _combine_frames(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    values = [df for df in frames.values() if df is not None and not df.empty]
+    return pd.concat(values, ignore_index=True) if values else pd.DataFrame()
+
+
+def _fetch_live_source_frames(
+    location: str,
+    is_remote: bool,
+    search_terms: list[str],
+    on_progress=None,
+) -> dict[str, pd.DataFrame]:
+    terms = list(dict.fromkeys(config.LIVE_SEARCH_TITLES + (search_terms or [])))
+    fetchers = {
+        "jobspy": lambda: job_cache.fetch_jobspy_jobs(
+            location, is_remote, config.MAX_JOB_AGE_HOURS, on_progress, terms
+        ),
+        "serpapi_google_jobs": lambda: google_jobs_serpapi.fetch_google_jobs(
+            terms, location, no_cache=config.LIVE_FRESH_SEARCH
+        ),
+        "company_ats": job_cache.fetch_company_ats_jobs,
+        "arbeitnow": arbeitnow.fetch_arbeitnow_jobs,
+        "adzuna": lambda: adzuna.fetch_adzuna_jobs(search_terms=terms),
+    }
+    frames: dict[str, pd.DataFrame] = {}
+    for label, fetcher in fetchers.items():
+        try:
+            df = fetcher()
+            frames[label] = df if df is not None else pd.DataFrame()
+            logger.info("live source=%s normalized_count=%s", label, len(frames[label]))
+        except Exception as e:
+            logger.warning("live source=%s failed: %s", label, e)
+            frames[label] = pd.DataFrame()
+    return frames
+
+
+def _prepare_live_jobs(raw_df: pd.DataFrame) -> pd.DataFrame:
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
+    df = job_cache.dedupe_prefer_sources(raw_df)
+    df = job_cache.add_freshness_metadata(df)
+    df = job_cache.add_linkedin_easy_apply_metadata(df)
+    return df.reset_index(drop=True)
+
+
+def _jobs_within_minutes(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    if df.empty:
+        return df
+    age = pd.to_numeric(df.get("posted_age_minutes"), errors="coerce")
+    return df[age.notna() & (age <= minutes)].copy().reset_index(drop=True)
+
+
+def _freshness_window_sequence(requested_minutes: int) -> list[int]:
+    windows = [requested_minutes]
+    windows.extend(
+        minutes for minutes in config.FALLBACK_FRESH_WINDOWS_MINUTES
+        if minutes > requested_minutes and minutes <= config.MAX_JOB_AGE_HOURS * 60
+    )
+    return list(dict.fromkeys(windows))
+
+
 def _fetch_jobposting_date(url: str) -> str | None:
     """Fetch a job page and extract datePosted from JSON-LD. Returns ISO string or None."""
     try:
@@ -271,7 +421,10 @@ async def _enrich_posted_times(df: pd.DataFrame) -> pd.DataFrame:
     if prec is None:
         return df
     needs = prec.fillna("unknown").isin(["day", "unknown"])
-    candidates = df[needs].nlargest(config.ENRICHMENT_TOP_N, "ats_score", keep="all")
+    if "ats_score" in df.columns:
+        candidates = df[needs].nlargest(config.ENRICHMENT_TOP_N, "ats_score", keep="all")
+    else:
+        candidates = df[needs].head(config.ENRICHMENT_TOP_N)
     if candidates.empty:
         return df
     for idx in candidates.index:
@@ -298,6 +451,186 @@ async def _enrich_posted_times(df: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             continue
     return df
+
+
+async def _run_live_fresh_search(
+    job_id: str,
+    resume_text: str,
+    resume_tokens: set[str],
+    skill_signals: list[str],
+    target_profile: dict,
+    total_yoe: int | None,
+    location: str,
+    is_remote: bool,
+    result_limit: int,
+    sort_mode: str,
+    freshness_window_minutes: int,
+    trail: list[str],
+) -> None:
+    requested_label = _window_label(freshness_window_minutes)
+    trail.extend([
+        f"Live fresh search: {config.LIVE_FRESH_SEARCH}",
+        "Job cache used: false",
+        f"SerpAPI no_cache: {config.LIVE_FRESH_SEARCH}",
+        f"Freshness requested: {requested_label}",
+        f"Result limit: {result_limit}",
+        f"Sort mode: {sort_mode}",
+        f"Max job age: {config.MAX_JOB_AGE_HOURS}h",
+    ])
+    _update_trail(job_id, trail)
+
+    frames = await asyncio.to_thread(
+        _fetch_live_source_frames,
+        location,
+        is_remote,
+        target_profile.get("target_titles") or config.LIVE_SEARCH_TITLES,
+        None,
+    )
+    raw_df = _combine_frames(frames)
+    raw_counts = job_cache.source_counts_from_df(raw_df)
+    trail.append(job_cache.format_source_counts(raw_counts))
+    trail.extend(_source_count_lines(raw_counts))
+
+    live_df = _prepare_live_jobs(raw_df)
+    normalized_counts = job_cache.source_counts_from_df(live_df)
+    trail.append("normalized " + job_cache.format_source_counts(normalized_counts))
+    _update_trail(job_id, trail)
+
+    for window in config.ALLOWED_FRESHNESS_WINDOWS_MINUTES:
+        if window <= config.MAX_JOB_AGE_HOURS * 60:
+            trail.append(f"Jobs within {_window_label(window)}: {len(_jobs_within_minutes(live_df, window))}")
+    _update_trail(job_id, trail)
+
+    if live_df.empty:
+        jobs_store.set_results(
+            job_id,
+            pd.DataFrame(),
+            message=_message_with_trail("No live jobs found from enabled sources.", trail),
+            low_confidence_df=pd.DataFrame(),
+        )
+        return
+
+    title_mask = ~live_df["title"].fillna("").astype(str).apply(scoring.title_blocked)
+    title_filtered = live_df[title_mask].reset_index(drop=True)
+    trail.append(f"Jobs after title exclusions: {len(title_filtered)}")
+
+    relevant_pool = await asyncio.to_thread(scoring.add_role_relevance, title_filtered, target_profile)
+    relevant_pool = await _enrich_posted_times(relevant_pool)
+    relevant_pool = await asyncio.to_thread(scoring.add_role_relevance, relevant_pool, target_profile)
+    relevance_mask = ~relevant_pool["exclude_by_default"].fillna(True)
+    recent_mask = pd.to_numeric(relevant_pool.get("posted_age_minutes"), errors="coerce").le(config.MAX_JOB_AGE_HOURS * 60)
+    allowed_mask = relevance_mask & recent_mask.fillna(False)
+    allowed_pool = relevant_pool[allowed_mask].reset_index(drop=True)
+    excluded_pool = relevant_pool[~allowed_mask].copy()
+    trail.append(f"Jobs after exclusions: {len(allowed_pool)}")
+    _update_trail(job_id, trail)
+
+    selected_window = config.MAX_JOB_AGE_HOURS * 60
+    selected_df = pd.DataFrame()
+    window_counts = {}
+    for window in _freshness_window_sequence(freshness_window_minutes):
+        candidates = _jobs_within_minutes(allowed_pool, window)
+        window_counts[window] = len(candidates)
+        selected_window = window
+        selected_df = candidates
+        if len(candidates) >= result_limit:
+            break
+
+    trail.append(f"Fallback window used: {_window_label(selected_window)}")
+    _update_trail(job_id, trail)
+
+    if selected_df.empty:
+        low_confidence = scoring.fallback_score_dataframe(
+            excluded_pool, resume_tokens, config.MAX_JOB_AGE_HOURS, target_profile
+        )
+        if not low_confidence.empty:
+            low_confidence = low_confidence[low_confidence["match_band"] == "broader"]
+        jobs_store.set_results(
+            job_id,
+            pd.DataFrame(),
+            message=_message_with_trail(f"No strong AI/ML matches from the last {_window_label(config.MAX_JOB_AGE_HOURS * 60)}.", trail),
+            low_confidence_df=low_confidence.head(result_limit),
+        )
+        return
+
+    candidate_df = scoring.sort_unscored_recent(selected_df).head(config.CANDIDATE_POOL_LIMIT)
+    filtered = await asyncio.to_thread(scoring.prefilter, candidate_df, resume_tokens)
+    if filtered.empty and not candidate_df.empty:
+        filtered = _recent_shortlist(candidate_df, config.PREFILTER_BYPASS_LIMIT)
+        trail.append(f"Jobs after prefilter: 0; scoring recent live shortlist: {len(filtered)}")
+    else:
+        trail.append(f"Jobs after prefilter: {len(filtered)}")
+    trail.append(f"Jobs sent to Claude scoring: {len(filtered)}")
+    _update_trail(job_id, trail)
+
+    try:
+        scored = await asyncio.wait_for(
+            asyncio.to_thread(
+                scoring.score_with_claude,
+                filtered,
+                resume_text,
+                skill_signals,
+                total_yoe,
+                ai_client,
+                resume_tokens,
+                selected_window / 60,
+                target_profile,
+            ),
+            timeout=config.SCRAPE_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        logger.warning("score_with_claude failed, using fallback scores: %s", e)
+        scored = await asyncio.to_thread(
+            scoring.fallback_score_dataframe, filtered, resume_tokens, selected_window / 60, target_profile
+        )
+
+    scored = await asyncio.to_thread(
+        scoring.apply_final_score_rules,
+        scoring.add_role_relevance(scored, target_profile),
+    )
+    scored = await _enrich_posted_times(scored)
+    trail.append(f"Jobs scored: {len(scored)}")
+
+    strong = scored[scored["match_band"].isin(["strong", "good"])].copy()
+    scored_low = scored.drop(strong.index, errors="ignore")
+    low_confidence = (
+        scoring.dedupe_display_jobs(scoring.sort_scored(scored_low, sort_mode))
+        if not scored_low.empty
+        else pd.DataFrame()
+    )
+    if not low_confidence.empty:
+        low_confidence = low_confidence[low_confidence["match_band"] == "broader"].head(result_limit).reset_index(drop=True)
+
+    final = scoring.sort_scored(strong, sort_mode).head(result_limit).reset_index(drop=True)
+    if not final.empty:
+        final.insert(0, "rank", range(1, len(final) + 1))
+    if not low_confidence.empty:
+        low_confidence.insert(0, "rank", range(1, len(low_confidence) + 1))
+    trail.append(f"Strong/good count: {len(strong)}")
+    trail.append(f"Broader count: {len(low_confidence)}")
+    trail.append(f"Final returned count: {len(final)}")
+    _update_trail(job_id, trail)
+
+    n = len(final)
+    if n == 0:
+        done_msg = f"No strong AI/ML matches from the last {_window_label(selected_window)}."
+    else:
+        done_msg = f"Found {n} strong AI/ML match{'' if n == 1 else 'es'}"
+        if selected_window > freshness_window_minutes:
+            requested_count = min(window_counts.get(freshness_window_minutes, 0), n)
+            additional = max(0, n - requested_count)
+            if requested_count:
+                done_msg += (
+                    f". Showing {requested_count} jobs from last {requested_label} "
+                    f"and {additional} additional jobs from last {_window_label(selected_window)}."
+                )
+            else:
+                done_msg += (
+                    f". No jobs from last {requested_label}; showing latest from last "
+                    f"{_window_label(selected_window)}."
+                )
+    done_msg += " | " + " → ".join(trail)
+    jobs_store.set_results(job_id, final, message=done_msg, low_confidence_df=low_confidence)
 
 
 async def _run_cached_search(
@@ -615,6 +948,8 @@ async def _run_analysis(
     is_remote: bool,
     hours_old: int,
     result_limit: int = config.DEFAULT_RESULT_LIMIT,
+    sort_mode: str = config.DEFAULT_SORT_MODE,
+    freshness_window_minutes: int = config.PRIMARY_FRESH_WINDOW_MINUTES,
 ) -> None:
     try:
         # Step 1: Resume — use cache if same filename, else parse + extract keywords
@@ -698,19 +1033,35 @@ async def _run_analysis(
         jobs_store.update_job(job_id, message=" → ".join(trail))
         logger.info("search_titles=%s skill_signals=%s", search_titles, skill_signals)
 
-        await _run_cached_search(
-            job_id=job_id,
-            resume_text=resume_text,
-            resume_tokens=resume_tokens,
-            skill_signals=skill_signals,
-            target_profile=target_profile,
-            total_yoe=total_yoe,
-            location=location,
-            is_remote=is_remote,
-            hours_old=hours_old,
-            result_limit=result_limit,
-            trail=trail,
-        )
+        if config.LIVE_FRESH_SEARCH and not config.USE_JOB_CACHE_FOR_ANALYZE:
+            await _run_live_fresh_search(
+                job_id=job_id,
+                resume_text=resume_text,
+                resume_tokens=resume_tokens,
+                skill_signals=skill_signals,
+                target_profile=target_profile,
+                total_yoe=total_yoe,
+                location=location,
+                is_remote=is_remote,
+                result_limit=result_limit,
+                sort_mode=sort_mode,
+                freshness_window_minutes=freshness_window_minutes,
+                trail=trail,
+            )
+        else:
+            await _run_cached_search(
+                job_id=job_id,
+                resume_text=resume_text,
+                resume_tokens=resume_tokens,
+                skill_signals=skill_signals,
+                target_profile=target_profile,
+                total_yoe=total_yoe,
+                location=location,
+                is_remote=is_remote,
+                hours_old=hours_old,
+                result_limit=result_limit,
+                trail=trail,
+            )
         return
 
     except Exception as e:

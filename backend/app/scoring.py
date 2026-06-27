@@ -466,16 +466,21 @@ def sort_unscored_recent(df: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-def sort_scored(df: pd.DataFrame) -> pd.DataFrame:
-    """Default recommended ranking for scored jobs."""
+def sort_scored(df: pd.DataFrame, sort_mode: str = "recommended") -> pd.DataFrame:
+    """Sort scored jobs by requested display mode."""
     if df.empty:
         return df
     df = _with_sort_columns(df)
-    df = df.sort_values(
-        ["_band_priority", "ats_score", "_sort_age", "_source_priority"],
-        ascending=[True, False, True, True],
-        na_position="last",
-    )
+    if sort_mode == "most_recent":
+        sort_cols = ["_sort_posted", "_band_priority", "ats_score", "_source_priority"]
+        ascending = [False, True, False, True]
+    elif sort_mode == "top_matched":
+        sort_cols = ["ats_score", "_band_priority", "_sort_age", "_source_priority"]
+        ascending = [False, True, True, True]
+    else:
+        sort_cols = ["_band_priority", "ats_score", "_sort_age", "_source_priority"]
+        ascending = [True, False, True, True]
+    df = df.sort_values(sort_cols, ascending=ascending, na_position="last")
     return df.drop(
         columns=["_band_priority", "_sort_age", "_sort_posted", "_source_priority"],
         errors="ignore",
